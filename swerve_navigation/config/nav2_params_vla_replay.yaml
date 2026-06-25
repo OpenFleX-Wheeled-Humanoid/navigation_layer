@@ -1,0 +1,179 @@
+# Nav2 参数配置 - VLA Replay 专用
+# 针对VLA replay场景优化，减少抖动，提高跟踪平滑度
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.01
+    min_y_velocity_threshold: 0.01
+    min_theta_velocity_threshold: 0.01
+    failure_tolerance: 0.5  # 增加容错，避免小误差导致失败
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.01  # replay 包含原地旋转，不能只按平移判断卡住
+      movement_time_allowance: 120.0
+
+    general_goal_checker:
+      stateful: true
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.08
+      yaw_goal_tolerance: 0.08
+
+    FollowPath:
+      plugin: "nmpc_controller::NmpcController"
+      horizon_steps: 20
+      horizon_time: 2.0
+      vla_replay_mode: true
+      vla_replay_point_dt: 0.2
+
+      # --- VLA Replay: 直接跟踪录制的时间序列轨迹 ---
+      Q_px: 50.0        # 降低位置跟踪权重
+      Q_py: 50.0
+      Q_theta: 8.0
+      Q_vx: 1.0
+      Q_vy: 1.0
+      Q_omega: 2.0
+
+      # --- 控制平滑性: 增加控制输入惩罚 ---
+      R_ax: 0.15        # 增加加速度惩罚，使运动更平滑
+      R_ay: 0.12        # 允许 replay 复现录制中的斜向/横向移动
+      R_alpha: 0.25     # 增加角加速度惩罚，减少抖动
+
+      # --- 终点误差权重 ---
+      Q_e_px: 60.0      # 降低终点位置权重
+      Q_e_py: 60.0
+      Q_e_theta: 8.0
+      Q_e_vx: 2.0
+      Q_e_vy: 2.0
+      Q_e_omega: 1.5
+
+      # --- 避障权重 ---
+      costmap_weight: 30.0  # 降低避障权重（replay时通常环境已知）
+
+      # --- 速度约束: 降低最大速度，提高稳定性 ---
+      vx_max: 0.30      # 降低最大线速度
+      vx_min: -0.25     # 覆盖录制回退段约 0.18m/s，避免时间滞后
+      vy_max: 0.22      # replay 需要复现 VR 录制中的斜向/横向移动
+      omega_max: 0.6    # 降低最大角速度
+      ax_max: 0.5       # 降低最大加速度
+      ay_max: 0.45      # 放开横向加速度，避免横移段被拖成前后移动
+      alpha_max: 1.0    # 降低最大角加速度
+
+      transform_tolerance: 0.2
+      desired_linear_vel: 0.20  # 降低期望速度
+      approach_velocity_scaling_dist: 1.0
+      allow_lateral_tracking: true
+      swerve_native_mode: false
+
+      # --- Replay 禁止控制器自行插入原地对齐动作 ---
+      start_heading_capture_dist: 0.0
+      start_speed_min_scale: 1.0
+
+      # --- 终点行为: 由 VLA 轨迹自身 theta 控制，不启用终点自动旋转 ---
+      goal_heading_align_ratio: 1.0
+      goal_heading_align_dist: 0.0
+      final_rotate_xy_tolerance: 0.05
+      final_rotate_xy_release_tolerance: 0.05
+      final_rotate_yaw_threshold: 3.14
+      final_rotate_yaw_goal_tolerance: 3.12
+
+      # --- 路径跟踪 ---
+      prune_search_distance: 4.0
+      same_goal_replan_attach_dist: 0.25
+
+      # --- 平滑参数: 增加平滑增益 ---
+      reference_heading_smoothing_gain: 0.25    # 增加航向平滑
+      reference_omega_smoothing_gain: 0.35      # 增加角速度平滑
+      reference_omega_rate_limit_scale: 0.50    # 降低角速度变化率
+      curve_speed_reduction_gain: 0.80
+      curve_speed_min_scale: 0.40
+      local_astar_enabled: false
+      rotate_to_heading_threshold: 3.14
+      rotate_to_heading_release_threshold: 3.12
+      rotate_to_heading_angular_vel: 0.35
+      rotate_to_heading_min_angular_vel: 0.0
+      rotate_to_heading_gain: 0.7
+      rotate_to_heading_goal_reset_dist: 10.0
+      rotate_to_heading_goal_reset_angle: 6.28
+      lio_odom_topic: /fastlio2/lio_odom
+      lio_odom_timeout: 0.6
+
+controller_server_rclcpp_node:
+  ros__parameters:
+    use_sim_time: false
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 50.0
+    scale_velocities: true
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.30, 0.22, 0.60]
+    min_velocity: [-0.25, -0.22, -0.60]
+    max_accel: [0.40, 0.45, 0.70]
+    max_decel: [-0.60, -0.45, -0.90]
+    odom_topic: "/fastlio2/lio_odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.35
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: false
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.05
+      robot_radius: 0.35
+      plugins: ["voxel_layer", "inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.55
+      voxel_layer:
+        plugin: "nav2_costmap_2d::VoxelLayer"
+        enabled: True
+        publish_voxel_map: True
+        origin_z: 0.0
+        z_resolution: 0.05
+        z_voxels: 16
+        max_obstacle_height: 2.0
+        mark_threshold: 0
+        observation_sources: lidar_3d d435
+        lidar_3d:
+          topic: /livox/body_cloud_nav2
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.0
+        d435:
+          topic: /camera/d435/depth/color/points_nav2
+          max_obstacle_height: 1.6
+          clearing: True
+          marking: True
+          data_type: "PointCloud2"
+          raytrace_max_range: 3.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 2.5
+          obstacle_min_range: 0.0
+      always_send_full_costmap: True
+  local_costmap_client:
+    ros__parameters:
+      use_sim_time: false
+  local_costmap_rclcpp_node:
+    ros__parameters:
+      use_sim_time: false

@@ -1,0 +1,2386 @@
+#include "nmpc_controller/nmpc_controller.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "nav2_core/exceptions.hpp"
+#include "nav2_costmap_2d/cost_values.hpp"
+#include "nav2_util/node_utils.hpp"
+#include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "pluginlib/class_list_macros.hpp"
+
+namespace nmpc_controller
+{
+
+static double normalizeAngle(double angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+static double interpolateAngle(double from, double to, double alpha)
+{
+  return normalizeAngle(from + alpha * normalizeAngle(to - from));
+}
+
+static double samplePathHeading(
+  const nav_msgs::msg::Path & local_path,
+  const geometry_msgs::msg::PoseStamped & pose_in_map,
+  double lookahead_dist)
+{
+  const double current_yaw = tf2::getYaw(pose_in_map.pose.orientation);
+  double path_yaw = current_yaw;
+  bool heading_sampled = false;
+  double accum = 0.0;
+
+  for (size_t i = 1; i < local_path.poses.size(); i++) {
+    const double dx =
+      local_path.poses[i].pose.position.x - local_path.poses[i - 1].pose.position.x;
+    const double dy =
+      local_path.poses[i].pose.position.y - local_path.poses[i - 1].pose.position.y;
+    accum += std::hypot(dx, dy);
+
+    const double dx_total =
+      local_path.poses[i].pose.position.x - pose_in_map.pose.position.x;
+    const double dy_total =
+      local_path.poses[i].pose.position.y - pose_in_map.pose.position.y;
+    if (std::hypot(dx_total, dy_total) > 0.05) {
+      path_yaw = std::atan2(dy_total, dx_total);
+      heading_sampled = true;
+    }
+
+    if (accum >= lookahead_dist) {
+      break;
+    }
+  }
+
+  if (!heading_sampled && local_path.poses.size() > 1) {
+    const auto & target = local_path.poses.back().pose.position;
+    const double dx_total = target.x - pose_in_map.pose.position.x;
+    const double dy_total = target.y - pose_in_map.pose.position.y;
+    if (std::hypot(dx_total, dy_total) > 0.05) {
+      path_yaw = std::atan2(dy_total, dx_total);
+    }
+  }
+
+  return path_yaw;
+}
+
+static bool interpolatePathPointAtArc(
+  const nav_msgs::msg::Path & local_path,
+  const std::vector<double> & arc_lengths,
+  double target_s,
+  double & px,
+  double & py)
+{
+  if (local_path.poses.empty() || arc_lengths.size() != local_path.poses.size()) {
+    return false;
+  }
+
+  if (local_path.poses.size() == 1) {
+    px = local_path.poses.front().pose.position.x;
+    py = local_path.poses.front().pose.position.y;
+    return true;
+  }
+
+  const double clamped_s = std::clamp(target_s, 0.0, arc_lengths.back());
+  auto it = std::lower_bound(arc_lengths.begin(), arc_lengths.end(), clamped_s);
+  size_t idx = std::distance(arc_lengths.begin(), it);
+  if (idx >= local_path.poses.size()) {
+    idx = local_path.poses.size() - 1;
+  }
+
+  if (idx == 0 || arc_lengths[idx] <= arc_lengths[idx - 1] + 1e-6) {
+    px = local_path.poses[idx].pose.position.x;
+    py = local_path.poses[idx].pose.position.y;
+    return true;
+  }
+
+  const double seg_len = arc_lengths[idx] - arc_lengths[idx - 1];
+  const double alpha = std::clamp((clamped_s - arc_lengths[idx - 1]) / seg_len, 0.0, 1.0);
+  const double x0 = local_path.poses[idx - 1].pose.position.x;
+  const double y0 = local_path.poses[idx - 1].pose.position.y;
+  const double x1 = local_path.poses[idx].pose.position.x;
+  const double y1 = local_path.poses[idx].pose.position.y;
+  px = x0 + alpha * (x1 - x0);
+  py = y0 + alpha * (y1 - y0);
+  return true;
+}
+
+static double samplePathHeadingAtArc(
+  const nav_msgs::msg::Path & local_path,
+  const std::vector<double> & arc_lengths,
+  double start_s,
+  double lookahead_dist,
+  double fallback_yaw)
+{
+  double x0, y0, x1, y1;
+  if (!interpolatePathPointAtArc(local_path, arc_lengths, start_s, x0, y0)) {
+    return fallback_yaw;
+  }
+
+  const double target_s = start_s + std::max(0.05, lookahead_dist);
+  if (!interpolatePathPointAtArc(local_path, arc_lengths, target_s, x1, y1)) {
+    return fallback_yaw;
+  }
+
+  const double dx = x1 - x0;
+  const double dy = y1 - y0;
+  if (std::hypot(dx, dy) < 0.04) {
+    return fallback_yaw;
+  }
+
+  return std::atan2(dy, dx);
+}
+
+static double computeSwerveNativeHeadingReference(
+  double px,
+  double py,
+  double goal_x,
+  double goal_y,
+  double final_goal_yaw)
+{
+  const double dx_g = goal_x - px;
+  const double dy_g = goal_y - py;
+  const double dist_to_goal = std::hypot(dx_g, dy_g);
+
+  // In native mode the body should keep facing the goal position while NMPC
+  // drives into the final zone. The final desired yaw is handled only by the
+  // dedicated in-place rotation state machine after position convergence.
+  if (dist_to_goal < 1e-3) {
+    return final_goal_yaw;
+  }
+
+  return std::atan2(dy_g, dx_g);
+}
+
+void NmpcController::configure(
+  const rclcpp_lifecycle::LifecycleNode::WeakPtr & parent,
+  std::string name,
+  std::shared_ptr<tf2_ros::Buffer> tf,
+  std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros)
+{
+  node_ = parent;
+  auto node = node_.lock();
+  if (!node) {
+    throw std::runtime_error("Failed to lock node in NmpcController::configure");
+  }
+
+  logger_ = node->get_logger();
+  clock_ = node->get_clock();
+  plugin_name_ = name;
+  tf_ = tf;
+  costmap_ros_ = costmap_ros;
+  costmap_ = costmap_ros_->getCostmap();
+
+  // Declare and get parameters
+  nav2_util::declare_parameter_if_not_declared(node, name + ".horizon_steps", rclcpp::ParameterValue(20));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".horizon_time", rclcpp::ParameterValue(2.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_px", rclcpp::ParameterValue(15.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_py", rclcpp::ParameterValue(15.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_theta", rclcpp::ParameterValue(10.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_vx", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_vy", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_omega", rclcpp::ParameterValue(0.5));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".R_ax", rclcpp::ParameterValue(0.1));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".R_ay", rclcpp::ParameterValue(0.1));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".R_alpha", rclcpp::ParameterValue(0.05));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_px", rclcpp::ParameterValue(30.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_py", rclcpp::ParameterValue(30.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_theta", rclcpp::ParameterValue(20.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_vx", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_vy", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".Q_e_omega", rclcpp::ParameterValue(0.5));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".costmap_weight", rclcpp::ParameterValue(50.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".vx_max", rclcpp::ParameterValue(0.5));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".vx_min", rclcpp::ParameterValue(-0.3));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".vy_max", rclcpp::ParameterValue(0.5));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".omega_max", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".ax_max", rclcpp::ParameterValue(2.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".ay_max", rclcpp::ParameterValue(2.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".alpha_max", rclcpp::ParameterValue(3.0));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".desired_linear_vel", rclcpp::ParameterValue(0.4));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".approach_velocity_scaling_dist", rclcpp::ParameterValue(0.5));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".goal_heading_align_ratio", rclcpp::ParameterValue(0.7));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".goal_heading_align_dist", rclcpp::ParameterValue(0.8));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".start_heading_capture_dist", rclcpp::ParameterValue(0.8));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".start_speed_min_scale", rclcpp::ParameterValue(0.4));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".prune_search_distance", rclcpp::ParameterValue(3.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".same_goal_replan_attach_dist", rclcpp::ParameterValue(0.18));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".reference_heading_smoothing_gain", rclcpp::ParameterValue(0.45));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".reference_omega_smoothing_gain", rclcpp::ParameterValue(0.55));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".reference_omega_rate_limit_scale", rclcpp::ParameterValue(0.65));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".curve_speed_reduction_gain", rclcpp::ParameterValue(0.35));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".curve_speed_min_scale", rclcpp::ParameterValue(0.35));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".curve_switch_yaw_rate_threshold", rclcpp::ParameterValue(0.35));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".curve_switch_speed_scale", rclcpp::ParameterValue(0.45));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".transform_tolerance", rclcpp::ParameterValue(0.1));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".allow_lateral_tracking", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".swerve_native_mode", rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".visualize", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".vla_replay_mode", rclcpp::ParameterValue(false));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".vla_replay_point_dt", rclcpp::ParameterValue(0.2));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_enabled", rclcpp::ParameterValue(true));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_cost_threshold", rclcpp::ParameterValue(0.40));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_reconnect_dist", rclcpp::ParameterValue(1.5));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_obstacle_lookahead", rclcpp::ParameterValue(2.5));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_inflation_cost", rclcpp::ParameterValue(0.30));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_smooth_iterations", rclcpp::ParameterValue(3));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".local_astar_smooth_weight", rclcpp::ParameterValue(0.3));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".rotate_to_heading_threshold", rclcpp::ParameterValue(0.8));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".rotate_to_heading_release_threshold", rclcpp::ParameterValue(0.2));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".rotate_to_heading_angular_vel", rclcpp::ParameterValue(0.8));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".rotate_to_heading_min_angular_vel", rclcpp::ParameterValue(0.2));
+  nav2_util::declare_parameter_if_not_declared(node, name + ".rotate_to_heading_gain", rclcpp::ParameterValue(1.0));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".rotate_to_heading_goal_reset_dist", rclcpp::ParameterValue(0.25));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".rotate_to_heading_goal_reset_angle", rclcpp::ParameterValue(0.35));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".final_rotate_xy_tolerance", rclcpp::ParameterValue(0.30));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".final_rotate_xy_release_tolerance", rclcpp::ParameterValue(0.36));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".final_rotate_yaw_threshold", rclcpp::ParameterValue(0.24));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".final_rotate_yaw_goal_tolerance", rclcpp::ParameterValue(0.15));
+
+  node->get_parameter(name + ".horizon_steps", horizon_steps_);
+  node->get_parameter(name + ".horizon_time", horizon_time_);
+
+  // Validate critical parameters
+  if (horizon_steps_ <= 0) {
+    throw std::runtime_error("horizon_steps must be positive, got " +
+      std::to_string(horizon_steps_));
+  }
+  if (horizon_time_ <= 0.0) {
+    throw std::runtime_error("horizon_time must be positive, got " +
+      std::to_string(horizon_time_));
+  }
+
+  double Q_px, Q_py, Q_theta, Q_vx, Q_vy, Q_omega;
+  double R_ax, R_ay, R_alpha;
+  double Q_e_px, Q_e_py, Q_e_theta, Q_e_vx, Q_e_vy, Q_e_omega;
+  double costmap_weight;
+  node->get_parameter(name + ".Q_px", Q_px);
+  node->get_parameter(name + ".Q_py", Q_py);
+  node->get_parameter(name + ".Q_theta", Q_theta);
+  node->get_parameter(name + ".Q_vx", Q_vx);
+  node->get_parameter(name + ".Q_vy", Q_vy);
+  node->get_parameter(name + ".Q_omega", Q_omega);
+  node->get_parameter(name + ".R_ax", R_ax);
+  node->get_parameter(name + ".R_ay", R_ay);
+  node->get_parameter(name + ".R_alpha", R_alpha);
+  node->get_parameter(name + ".Q_e_px", Q_e_px);
+  node->get_parameter(name + ".Q_e_py", Q_e_py);
+  node->get_parameter(name + ".Q_e_theta", Q_e_theta);
+  node->get_parameter(name + ".Q_e_vx", Q_e_vx);
+  node->get_parameter(name + ".Q_e_vy", Q_e_vy);
+  node->get_parameter(name + ".Q_e_omega", Q_e_omega);
+  node->get_parameter(name + ".costmap_weight", costmap_weight);
+  node->get_parameter(name + ".vx_max", vx_max_);
+  node->get_parameter(name + ".vx_min", vx_min_);
+  node->get_parameter(name + ".vy_max", vy_max_);
+  node->get_parameter(name + ".omega_max", omega_max_);
+  node->get_parameter(name + ".ax_max", ax_max_);
+  node->get_parameter(name + ".ay_max", ay_max_);
+  node->get_parameter(name + ".alpha_max", alpha_max_);
+  node->get_parameter(name + ".desired_linear_vel", desired_linear_vel_);
+  desired_linear_vel_base_ = desired_linear_vel_;
+  node->get_parameter(name + ".approach_velocity_scaling_dist", approach_velocity_scaling_dist_);
+  node->get_parameter(name + ".goal_heading_align_ratio", goal_heading_align_ratio_);
+  node->get_parameter(name + ".goal_heading_align_dist", goal_heading_align_dist_);
+  node->get_parameter(name + ".start_heading_capture_dist", start_heading_capture_dist_);
+  node->get_parameter(name + ".start_speed_min_scale", start_speed_min_scale_);
+  node->get_parameter(name + ".prune_search_distance", prune_search_distance_);
+  node->get_parameter(name + ".same_goal_replan_attach_dist", same_goal_replan_attach_dist_);
+  node->get_parameter(
+    name + ".reference_heading_smoothing_gain", reference_heading_smoothing_gain_);
+  node->get_parameter(
+    name + ".reference_omega_smoothing_gain", reference_omega_smoothing_gain_);
+  node->get_parameter(
+    name + ".reference_omega_rate_limit_scale", reference_omega_rate_limit_scale_);
+  node->get_parameter(name + ".curve_speed_reduction_gain", curve_speed_reduction_gain_);
+  node->get_parameter(name + ".curve_speed_min_scale", curve_speed_min_scale_);
+  node->get_parameter(name + ".curve_switch_yaw_rate_threshold", curve_switch_yaw_rate_threshold_);
+  node->get_parameter(name + ".curve_switch_speed_scale", curve_switch_speed_scale_);
+  node->get_parameter(name + ".transform_tolerance", transform_tolerance_);
+  node->get_parameter(name + ".allow_lateral_tracking", allow_lateral_tracking_);
+  node->get_parameter(name + ".swerve_native_mode", swerve_native_mode_);
+  node->get_parameter(name + ".visualize", visualize_);
+  node->get_parameter(name + ".vla_replay_mode", vla_replay_mode_);
+  node->get_parameter(name + ".vla_replay_point_dt", vla_replay_point_dt_);
+  node->get_parameter(name + ".local_astar_enabled", local_astar_enabled_);
+  node->get_parameter(name + ".local_astar_cost_threshold", local_astar_cost_threshold_);
+  node->get_parameter(name + ".local_astar_reconnect_dist", local_astar_reconnect_dist_);
+  node->get_parameter(name + ".local_astar_obstacle_lookahead", local_astar_obstacle_lookahead_);
+  node->get_parameter(name + ".local_astar_inflation_cost", local_astar_inflation_cost_);
+  node->get_parameter(name + ".local_astar_smooth_iterations", local_astar_smooth_iterations_);
+  node->get_parameter(name + ".local_astar_smooth_weight", local_astar_smooth_weight_);
+  node->get_parameter(name + ".rotate_to_heading_threshold", rotate_to_heading_threshold_);
+  node->get_parameter(
+    name + ".rotate_to_heading_release_threshold", rotate_to_heading_release_threshold_);
+  node->get_parameter(name + ".rotate_to_heading_angular_vel", rotate_to_heading_angular_vel_);
+  node->get_parameter(
+    name + ".rotate_to_heading_min_angular_vel", rotate_to_heading_min_angular_vel_);
+  node->get_parameter(name + ".rotate_to_heading_gain", rotate_to_heading_gain_);
+  node->get_parameter(
+    name + ".rotate_to_heading_goal_reset_dist", rotate_to_heading_goal_reset_dist_);
+  node->get_parameter(
+    name + ".rotate_to_heading_goal_reset_angle", rotate_to_heading_goal_reset_angle_);
+  node->get_parameter(
+    name + ".final_rotate_xy_tolerance", final_rotate_xy_tolerance_);
+  node->get_parameter(
+    name + ".final_rotate_xy_release_tolerance", final_rotate_xy_release_tolerance_);
+  node->get_parameter(
+    name + ".final_rotate_yaw_threshold", final_rotate_yaw_threshold_);
+  node->get_parameter(
+    name + ".final_rotate_yaw_goal_tolerance", final_rotate_yaw_goal_tolerance_);
+
+  local_astar_cost_threshold_ = std::clamp(local_astar_cost_threshold_, 0.0, 1.0);
+  local_astar_reconnect_dist_ = std::max(0.1, local_astar_reconnect_dist_);
+  local_astar_obstacle_lookahead_ = std::max(0.1, local_astar_obstacle_lookahead_);
+  local_astar_inflation_cost_ = std::clamp(local_astar_inflation_cost_, 0.0, 1.0);
+  local_astar_smooth_iterations_ = std::max(0, local_astar_smooth_iterations_);
+  local_astar_smooth_weight_ = std::clamp(local_astar_smooth_weight_, 0.0, 0.95);
+
+  same_goal_replan_attach_dist_ = std::max(0.05, same_goal_replan_attach_dist_);
+  start_heading_capture_dist_ = std::max(0.0, start_heading_capture_dist_);
+  start_speed_min_scale_ = std::clamp(start_speed_min_scale_, 0.05, 1.0);
+  reference_omega_smoothing_gain_ = std::clamp(reference_omega_smoothing_gain_, 0.0, 0.95);
+  reference_omega_rate_limit_scale_ = std::clamp(reference_omega_rate_limit_scale_, 0.0, 1.5);
+  curve_speed_reduction_gain_ = std::max(0.0, curve_speed_reduction_gain_);
+  curve_speed_min_scale_ = std::clamp(curve_speed_min_scale_, 0.05, 1.0);
+  curve_switch_yaw_rate_threshold_ = std::max(0.0, curve_switch_yaw_rate_threshold_);
+  curve_switch_speed_scale_ = std::clamp(curve_switch_speed_scale_, 0.05, 1.0);
+  vla_replay_point_dt_ = std::max(0.02, vla_replay_point_dt_);
+
+  rotate_to_heading_threshold_ = std::max(0.0, rotate_to_heading_threshold_);
+  rotate_to_heading_release_threshold_ = std::clamp(
+    rotate_to_heading_release_threshold_, 0.0, rotate_to_heading_threshold_);
+  rotate_to_heading_angular_vel_ = std::max(0.0, rotate_to_heading_angular_vel_);
+  rotate_to_heading_min_angular_vel_ = std::clamp(
+    rotate_to_heading_min_angular_vel_, 0.0, rotate_to_heading_angular_vel_);
+  rotate_to_heading_gain_ = std::max(0.0, rotate_to_heading_gain_);
+  rotate_to_heading_goal_reset_dist_ = std::max(0.0, rotate_to_heading_goal_reset_dist_);
+  rotate_to_heading_goal_reset_angle_ = std::max(0.0, rotate_to_heading_goal_reset_angle_);
+  final_rotate_xy_tolerance_ = std::max(0.05, final_rotate_xy_tolerance_);
+  final_rotate_xy_release_tolerance_ = std::max(
+    final_rotate_xy_tolerance_, final_rotate_xy_release_tolerance_);
+  final_rotate_yaw_goal_tolerance_ = std::max(0.02, final_rotate_yaw_goal_tolerance_);
+  final_rotate_yaw_threshold_ = std::max(
+    final_rotate_yaw_goal_tolerance_ + 0.02, final_rotate_yaw_threshold_);
+  rotating_to_heading_ = false;
+  initial_heading_alignment_complete_ = false;
+  final_heading_alignment_active_ = false;
+  final_heading_done_ = false;
+  current_goal_valid_ = false;
+
+  if (swerve_native_mode_) {
+    allow_lateral_tracking_ = true;
+    RCLCPP_INFO(logger_, "Swerve-native mode enabled: heading faces goal, omni motion");
+  }
+  if (vla_replay_mode_) {
+    allow_lateral_tracking_ = true;
+    local_astar_enabled_ = false;
+    RCLCPP_INFO(logger_,
+      "VLA replay mode enabled: time-ordered path orientation references, heading alignment disabled");
+  }
+
+  W_diag_ = {Q_px, Q_py, Q_theta, Q_vx, Q_vy, Q_omega,
+             R_ax, R_ay, R_alpha,
+             costmap_weight};
+  W_e_diag_ = {Q_e_px, Q_e_py, Q_e_theta, Q_e_vx, Q_e_vy, Q_e_omega};
+
+  // Initialize solver
+  solver_ = std::make_unique<AcadosWrapper>();
+  if (!solver_->initialize(horizon_steps_, horizon_time_)) {
+    throw std::runtime_error("Failed to initialize acados NMPC solver");
+  }
+
+  // Set weights and bounds
+  solver_->setStageWeights(W_diag_);
+  solver_->setTerminalWeights(W_e_diag_);
+  solver_->setControlBounds(ax_max_, ay_max_, alpha_max_);
+  solver_->setStateBounds(vx_min_, vx_max_, vy_max_, omega_max_);
+
+  stage_refs_.resize(horizon_steps_ + 1);
+
+  // Visualization publishers
+  if (visualize_) {
+    predicted_path_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+      "predicted_path", 1);
+    astar_detour_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+      "astar_detour_path", 1);
+  }
+
+  // FAST-LIO2 odom subscription for velocity consistent with pose source
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".lio_odom_topic", rclcpp::ParameterValue("/fastlio2/lio_odom"));
+  nav2_util::declare_parameter_if_not_declared(
+    node, name + ".lio_odom_timeout", rclcpp::ParameterValue(0.5));
+  node->get_parameter(name + ".lio_odom_topic", lio_odom_topic_);
+  node->get_parameter(name + ".lio_odom_timeout", lio_odom_timeout_);
+
+  lio_odom_sub_ = node->create_subscription<nav_msgs::msg::Odometry>(
+    lio_odom_topic_, rclcpp::SensorDataQoS(),
+    [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+      lio_velocity_ = msg->twist.twist;
+      lio_velocity_stamp_ = rclcpp::Time(msg->header.stamp);
+      lio_velocity_valid_ = true;
+    });
+
+  RCLCPP_INFO(logger_, "NMPC Controller configured: N=%d, Tf=%.1f, vmax=%.2f, lio_odom=%s",
+    horizon_steps_, horizon_time_, vx_max_, lio_odom_topic_.c_str());
+}
+
+void NmpcController::cleanup()
+{
+  RCLCPP_INFO(logger_, "Cleaning up NMPC Controller");
+  lio_odom_sub_.reset();
+  if (predicted_path_pub_) {
+    predicted_path_pub_.reset();
+  }
+  if (astar_detour_pub_) {
+    astar_detour_pub_.reset();
+  }
+  if (solver_) {
+    solver_->cleanup();
+  }
+}
+
+void NmpcController::activate()
+{
+  RCLCPP_INFO(logger_, "Activating NMPC Controller");
+  if (predicted_path_pub_) {
+    predicted_path_pub_->on_activate();
+  }
+  if (astar_detour_pub_) {
+    astar_detour_pub_->on_activate();
+  }
+  consecutive_failures_ = 0;
+}
+
+void NmpcController::deactivate()
+{
+  RCLCPP_INFO(logger_, "Deactivating NMPC Controller");
+  if (predicted_path_pub_) {
+    predicted_path_pub_->on_deactivate();
+  }
+  if (astar_detour_pub_) {
+    astar_detour_pub_->on_deactivate();
+  }
+}
+
+void NmpcController::setPlan(const nav_msgs::msg::Path & path)
+{
+  bool reset_initial_heading_alignment = global_plan_.poses.empty() || !current_goal_valid_;
+
+  if (!path.poses.empty()) {
+    const auto & new_goal = path.poses.back();
+    if (!reset_initial_heading_alignment) {
+      const auto & previous_goal = current_goal_pose_.pose.position;
+      const auto & next_goal = new_goal.pose.position;
+      const double goal_dist = std::hypot(
+        next_goal.x - previous_goal.x,
+        next_goal.y - previous_goal.y);
+      const double previous_goal_yaw = tf2::getYaw(current_goal_pose_.pose.orientation);
+      const double next_goal_yaw = tf2::getYaw(new_goal.pose.orientation);
+      const double goal_yaw_delta = std::abs(normalizeAngle(next_goal_yaw - previous_goal_yaw));
+      reset_initial_heading_alignment =
+        goal_dist > rotate_to_heading_goal_reset_dist_ ||
+        goal_yaw_delta > rotate_to_heading_goal_reset_angle_;
+    }
+
+    current_goal_pose_ = new_goal;
+    current_goal_valid_ = true;
+  } else {
+    reset_initial_heading_alignment = true;
+    current_goal_valid_ = false;
+  }
+
+  if (vla_replay_mode_) {
+    global_plan_ = path;
+    last_pruned_plan_index_ = 0;
+    rotating_to_heading_ = false;
+    initial_heading_alignment_complete_ = true;
+    final_heading_alignment_active_ = false;
+    final_heading_done_ = false;
+    last_same_goal_replan_accept_valid_ = false;
+    last_same_goal_replan_was_smoothed_obstacle_handoff_ = false;
+    startup_heading_capture_origin_valid_ = false;
+    startup_heading_capture_progress_ = 0.0;
+    return;
+  }
+
+  // Same-goal replans can oscillate between homotopy classes in narrow passages.
+  // If the robot is still well-tracked on the current path, reject a new path
+  // that would immediately pull the local reference backwards or in the
+  // opposite local direction.
+  bool reject_same_goal_replan = false;
+  bool accepted_same_goal_replan = false;
+  bool smooth_obstacle_replan_handoff = false;
+  if (!reset_initial_heading_alignment && last_robot_position_valid_ &&
+      !global_plan_.poses.empty() && path.poses.size() > 1)
+  {
+    const auto sampleLookaheadPoint = [](const nav_msgs::msg::Path & candidate,
+        double rx, double ry, double lookahead_dist,
+        geometry_msgs::msg::Point & point, double & dist_to_closest) -> bool
+      {
+        if (candidate.poses.empty()) {
+          return false;
+        }
+
+        size_t closest_idx = 0;
+        double min_dist_sq = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < candidate.poses.size(); i++) {
+          const double dx = candidate.poses[i].pose.position.x - rx;
+          const double dy = candidate.poses[i].pose.position.y - ry;
+          const double dist_sq = dx * dx + dy * dy;
+          if (dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            closest_idx = i;
+          }
+        }
+
+        dist_to_closest = std::sqrt(min_dist_sq);
+        point = candidate.poses[closest_idx].pose.position;
+
+        double accum = 0.0;
+        for (size_t i = closest_idx + 1; i < candidate.poses.size(); i++) {
+          const auto & prev = candidate.poses[i - 1].pose.position;
+          const auto & curr = candidate.poses[i].pose.position;
+          const double seg_len = std::hypot(curr.x - prev.x, curr.y - prev.y);
+          if (seg_len < 1e-6) {
+            continue;
+          }
+
+          if (accum + seg_len >= lookahead_dist) {
+            const double alpha = (lookahead_dist - accum) / seg_len;
+            point.x = prev.x + alpha * (curr.x - prev.x);
+            point.y = prev.y + alpha * (curr.y - prev.y);
+            point.z = prev.z + alpha * (curr.z - prev.z);
+            return true;
+          }
+
+          accum += seg_len;
+          point = curr;
+        }
+
+        return true;
+      };
+
+    const double rx = last_robot_position_map_.x;
+    const double ry = last_robot_position_map_.y;
+    geometry_msgs::msg::Point old_lookahead;
+    geometry_msgs::msg::Point new_lookahead;
+    geometry_msgs::msg::Point old_short_lookahead;
+    geometry_msgs::msg::Point new_short_lookahead;
+    geometry_msgs::msg::Point old_far_lookahead;
+    geometry_msgs::msg::Point new_far_lookahead;
+    double old_dist_to_path = std::numeric_limits<double>::max();
+    double new_dist_to_path = std::numeric_limits<double>::max();
+    double old_short_dist_to_path = std::numeric_limits<double>::max();
+    double new_short_dist_to_path = std::numeric_limits<double>::max();
+    double old_far_dist_to_path = std::numeric_limits<double>::max();
+    double new_far_dist_to_path = std::numeric_limits<double>::max();
+
+    if (sampleLookaheadPoint(global_plan_, rx, ry, 0.40, old_lookahead, old_dist_to_path) &&
+        sampleLookaheadPoint(path, rx, ry, 0.40, new_lookahead, new_dist_to_path) &&
+        sampleLookaheadPoint(global_plan_, rx, ry, 0.22, old_short_lookahead, old_short_dist_to_path) &&
+        sampleLookaheadPoint(path, rx, ry, 0.22, new_short_lookahead, new_short_dist_to_path) &&
+        sampleLookaheadPoint(global_plan_, rx, ry, 0.65, old_far_lookahead, old_far_dist_to_path) &&
+        sampleLookaheadPoint(path, rx, ry, 0.65, new_far_lookahead, new_far_dist_to_path))
+    {
+      const double old_dx = old_lookahead.x - rx;
+      const double old_dy = old_lookahead.y - ry;
+      const double new_dx = new_lookahead.x - rx;
+      const double new_dy = new_lookahead.y - ry;
+      const double old_norm = std::hypot(old_dx, old_dy);
+      const double new_norm = std::hypot(new_dx, new_dy);
+
+      double directional_alignment = 1.0;
+      if (old_norm > 1e-3 && new_norm > 1e-3) {
+        directional_alignment =
+          (old_dx * new_dx + old_dy * new_dy) / (old_norm * new_norm);
+      }
+
+      const auto & goal_pos = current_goal_pose_.pose.position;
+      const double goal_heading = std::atan2(goal_pos.y - ry, goal_pos.x - rx);
+      const double old_goal_progress = std::cos(goal_heading) * old_dx + std::sin(goal_heading) * old_dy;
+      const double new_goal_progress = std::cos(goal_heading) * new_dx + std::sin(goal_heading) * new_dy;
+
+      const bool current_path_is_trackable = old_dist_to_path < 0.12;
+      const bool new_path_turns_back = old_goal_progress > 0.05 && new_goal_progress < -0.05;
+      const bool new_path_opposes_current =
+        old_norm > 0.10 && new_norm > 0.10 && directional_alignment < -0.25;
+
+      const double old_short_dx = old_short_lookahead.x - rx;
+      const double old_short_dy = old_short_lookahead.y - ry;
+      const double new_short_dx = new_short_lookahead.x - rx;
+      const double new_short_dy = new_short_lookahead.y - ry;
+      const double old_short_norm = std::hypot(old_short_dx, old_short_dy);
+      const double new_short_norm = std::hypot(new_short_dx, new_short_dy);
+      const double old_short_heading = std::atan2(old_short_dy, old_short_dx);
+      const double new_short_heading = std::atan2(new_short_dy, new_short_dx);
+      const double short_heading_delta = std::abs(
+        normalizeAngle(new_short_heading - old_short_heading));
+      const double short_delta_x = new_short_lookahead.x - old_short_lookahead.x;
+      const double short_delta_y = new_short_lookahead.y - old_short_lookahead.y;
+      const double short_lateral_jump = std::abs(
+        -std::sin(old_short_heading) * short_delta_x +
+        std::cos(old_short_heading) * short_delta_y);
+      const double short_along_jump =
+        std::cos(old_short_heading) * short_delta_x +
+        std::sin(old_short_heading) * short_delta_y;
+      const bool new_path_local_switch =
+        old_short_norm > 0.10 && new_short_norm > 0.10 &&
+        short_heading_delta > 0.55 && short_lateral_jump > 0.08 &&
+        short_along_jump < 0.18;
+      const bool no_clear_path_improvement =
+        new_dist_to_path > old_dist_to_path - 0.03 &&
+        new_goal_progress < old_goal_progress + 0.08;
+      const double old_short_cost = getCostmapCost(old_short_lookahead.x, old_short_lookahead.y);
+      const double new_short_cost = getCostmapCost(new_short_lookahead.x, new_short_lookahead.y);
+      const double old_mid_cost = getCostmapCost(old_lookahead.x, old_lookahead.y);
+      const double new_mid_cost = getCostmapCost(new_lookahead.x, new_lookahead.y);
+      const double old_far_cost = getCostmapCost(old_far_lookahead.x, old_far_lookahead.y);
+      const double new_far_cost = getCostmapCost(new_far_lookahead.x, new_far_lookahead.y);
+      const double old_path_obstacle_pressure = std::max(
+        old_short_cost, std::max(old_mid_cost, old_far_cost));
+      const double new_path_obstacle_pressure = std::max(
+        new_short_cost, std::max(new_mid_cost, new_far_cost));
+      const bool current_path_near_obstacle = old_path_obstacle_pressure > 0.32;
+      const bool new_path_improves_clearance =
+        new_path_obstacle_pressure < old_path_obstacle_pressure - 0.06;
+      const bool obstacle_clearance_override =
+        current_path_near_obstacle && new_path_improves_clearance;
+      const double required_local_attachment_dist = std::max(
+        same_goal_replan_attach_dist_, old_dist_to_path + 0.10);
+      const bool detached_same_goal_replan =
+        current_path_is_trackable &&
+        new_dist_to_path > required_local_attachment_dist;
+      const bool obstacle_replan_has_large_local_jump =
+        short_heading_delta > 0.85 || short_lateral_jump > 0.12;
+      const bool within_smoothed_obstacle_replan_lockout =
+        last_same_goal_replan_accept_valid_ &&
+        last_same_goal_replan_was_smoothed_obstacle_handoff_ &&
+        (clock_->now() - last_same_goal_replan_accept_stamp_).seconds() < 0.90;
+      const bool within_same_goal_replan_holdoff =
+        last_same_goal_replan_accept_valid_ &&
+        (clock_->now() - last_same_goal_replan_accept_stamp_).seconds() < 0.35;
+      const bool new_path_replan_chatter =
+        short_heading_delta > 0.35 && short_lateral_jump > 0.05;
+
+      if (within_smoothed_obstacle_replan_lockout) {
+        reject_same_goal_replan = true;
+        const double lockout_remaining = 0.90 -
+          (clock_->now() - last_same_goal_replan_accept_stamp_).seconds();
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 500,
+          "setPlan: holding large-jump obstacle replan (remaining=%.2f heading_delta=%.2f lat_jump=%.3f old_cost=%.2f new_cost=%.2f)",
+          std::max(0.0, lockout_remaining),
+          short_heading_delta, short_lateral_jump,
+          old_path_obstacle_pressure, new_path_obstacle_pressure);
+      } else if (obstacle_clearance_override) {
+        accepted_same_goal_replan = true;
+        smooth_obstacle_replan_handoff =
+          obstacle_replan_has_large_local_jump || detached_same_goal_replan;
+        RCLCPP_INFO_THROTTLE(
+          logger_, *clock_, 1000,
+          "setPlan: accepted obstacle-driven same-goal replan (old_cost=%.2f new_cost=%.2f heading_delta=%.2f lat_jump=%.3f large_jump=%d)",
+          old_path_obstacle_pressure, new_path_obstacle_pressure,
+          short_heading_delta, short_lateral_jump,
+          smooth_obstacle_replan_handoff ? 1 : 0);
+      } else if (detached_same_goal_replan) {
+        reject_same_goal_replan = true;
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 1000,
+          "setPlan: rejected detached same-goal replan (old_dist=%.3f new_dist=%.3f attach_limit=%.3f old_cost=%.2f new_cost=%.2f)",
+          old_dist_to_path, new_dist_to_path, required_local_attachment_dist,
+          old_path_obstacle_pressure, new_path_obstacle_pressure);
+      } else if (current_path_is_trackable &&
+        (new_path_turns_back || new_path_opposes_current ||
+        (new_path_local_switch && no_clear_path_improvement) ||
+        (within_same_goal_replan_holdoff && new_path_replan_chatter && no_clear_path_improvement)))
+      {
+        reject_same_goal_replan = true;
+        RCLCPP_WARN_THROTTLE(
+          logger_, *clock_, 2000,
+          "setPlan: rejected same-goal replan (old_progress=%.3f new_progress=%.3f align=%.2f heading_delta=%.2f lat_jump=%.3f old_dist=%.3f new_dist=%.3f old_cost=%.2f new_cost=%.2f)",
+          old_goal_progress, new_goal_progress, directional_alignment,
+          short_heading_delta, short_lateral_jump,
+          old_dist_to_path, new_dist_to_path,
+          old_path_obstacle_pressure, new_path_obstacle_pressure);
+      } else {
+        accepted_same_goal_replan = true;
+      }
+    } else {
+      // Lookahead sampling failed: accept conservatively but update timestamp
+      accepted_same_goal_replan = true;
+      RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+        "setPlan: same-goal replan lookahead sampling failed, accepting conservatively");
+    }
+  }
+
+  if (reject_same_goal_replan) {
+    return;
+  }
+
+  global_plan_ = path;
+
+  if (accepted_same_goal_replan) {
+    last_same_goal_replan_accept_stamp_ = clock_->now();
+    last_same_goal_replan_accept_valid_ = true;
+    last_same_goal_replan_was_smoothed_obstacle_handoff_ =
+      smooth_obstacle_replan_handoff;
+  } else if (reset_initial_heading_alignment) {
+    last_same_goal_replan_accept_valid_ = false;
+    last_same_goal_replan_was_smoothed_obstacle_handoff_ = false;
+  }
+
+  // When the goal hasn't changed (same-goal replan due to IsPathValid),
+  // warm-start the prune index by finding the closest point on the new path
+  // to the robot's last known position.  This prevents the reference from
+  // jumping back to the path start, which causes wheel oscillation.
+  bool warm_started_prune = false;
+  if (!reset_initial_heading_alignment && last_robot_position_valid_ &&
+      global_plan_.poses.size() > 1)
+  {
+    const double rx = last_robot_position_map_.x;
+    const double ry = last_robot_position_map_.y;
+    double min_dist_sq = std::numeric_limits<double>::max();
+    size_t best_idx = 0;
+    for (size_t i = 0; i < global_plan_.poses.size(); i++) {
+      const double dx = global_plan_.poses[i].pose.position.x - rx;
+      const double dy = global_plan_.poses[i].pose.position.y - ry;
+      const double d2 = dx * dx + dy * dy;
+      if (d2 < min_dist_sq) {
+        min_dist_sq = d2;
+        best_idx = i;
+      }
+    }
+    last_pruned_plan_index_ = best_idx;
+    warm_started_prune = true;
+    const double warm_start_dist = std::sqrt(min_dist_sq);
+    RCLCPP_INFO(logger_,
+      "setPlan: same-goal replan, warm-started prune index to %zu (dist=%.3f m)",
+      best_idx, warm_start_dist);
+    if (warm_start_dist > same_goal_replan_attach_dist_) {
+      RCLCPP_WARN(logger_,
+        "setPlan: accepted same-goal replan still starts %.3f m away from robot (attach_limit=%.3f, idx=%zu)",
+        warm_start_dist, same_goal_replan_attach_dist_, best_idx);
+    }
+  }
+  if (!warm_started_prune) {
+    last_pruned_plan_index_ = 0;
+  }
+
+  if (reset_initial_heading_alignment) {
+    rotating_to_heading_ = false;
+    initial_heading_alignment_complete_ = false;
+    final_heading_alignment_active_ = false;
+    final_heading_done_ = false;
+    last_same_goal_replan_accept_valid_ = false;
+    startup_heading_capture_origin_valid_ = false;
+    startup_heading_capture_progress_ = 0.0;
+  }
+}
+
+void NmpcController::setSpeedLimit(const double & speed_limit, const bool & percentage)
+{
+  if (percentage) {
+    desired_linear_vel_ = desired_linear_vel_base_ * speed_limit / 100.0;
+  } else {
+    desired_linear_vel_ = speed_limit;
+  }
+}
+
+geometry_msgs::msg::TwistStamped NmpcController::computeVelocityCommands(
+  const geometry_msgs::msg::PoseStamped & pose,
+  const geometry_msgs::msg::Twist & velocity,
+  nav2_core::GoalChecker * /*goal_checker*/)
+{
+  // 1. Prune global path (stays in map frame) and get robot pose in map frame
+  geometry_msgs::msg::PoseStamped pose_in_map;
+  auto local_path = transformGlobalPlan(pose, pose_in_map);
+
+  if (local_path.poses.empty()) {
+    throw nav2_core::PlannerException("Transformed plan is empty");
+  }
+
+  // 1.5 A* local avoidance: detect obstacles and splice detour into local_path
+  if (local_astar_enabled_) {
+    local_path = localAstarAvoidance(local_path, pose_in_map);
+  }
+
+  // 2. Get current yaw (in map frame)
+  double yaw = tf2::getYaw(pose_in_map.pose.orientation);
+
+  // 2.5 Only do an in-place heading alignment once at the start of a new goal.
+  double path_yaw = samplePathHeading(local_path, pose_in_map, 0.35);
+  const double native_heading_lookahead_dist = std::clamp(
+    desired_linear_vel_ * 0.6, 0.16, 0.28);
+  if (swerve_native_mode_ && local_path.poses.size() > 1) {
+    std::vector<double> startup_arc_lengths(local_path.poses.size(), 0.0);
+    for (size_t i = 1; i < local_path.poses.size(); i++) {
+      const double dx =
+        local_path.poses[i].pose.position.x - local_path.poses[i - 1].pose.position.x;
+      const double dy =
+        local_path.poses[i].pose.position.y - local_path.poses[i - 1].pose.position.y;
+      startup_arc_lengths[i] = startup_arc_lengths[i - 1] + std::hypot(dx, dy);
+    }
+    path_yaw = samplePathHeadingAtArc(
+      local_path, startup_arc_lengths, 0.0, native_heading_lookahead_dist, path_yaw);
+  }
+  const double startup_path_progress = startup_heading_capture_progress_;
+  double initial_alignment_heading = path_yaw;
+  if (swerve_native_mode_ && !global_plan_.poses.empty()) {
+    const auto & final_goal = global_plan_.poses.back().pose;
+    const double native_initial_heading = computeSwerveNativeHeadingReference(
+      pose_in_map.pose.position.x,
+      pose_in_map.pose.position.y,
+      final_goal.position.x,
+      final_goal.position.y,
+      tf2::getYaw(final_goal.orientation));
+    // Keep startup rotate-to-heading consistent with the first NMPC theta refs:
+    // native mode should still capture the path tangent briefly before it
+    // transitions into goal-facing travel.
+    if (start_heading_capture_dist_ > 1e-6 &&
+      startup_path_progress < start_heading_capture_dist_)
+    {
+      const double capture_blend = std::clamp(
+        startup_path_progress / start_heading_capture_dist_, 0.0, 1.0);
+      initial_alignment_heading = interpolateAngle(
+        path_yaw, native_initial_heading, capture_blend);
+    } else {
+      initial_alignment_heading = native_initial_heading;
+    }
+  }
+  const double heading_error = normalizeAngle(initial_alignment_heading - yaw);
+  const double abs_heading_error = std::abs(heading_error);
+  const double initial_alignment_threshold =
+    swerve_native_mode_ ? std::min(rotate_to_heading_threshold_, 0.26) : rotate_to_heading_threshold_;
+  const double initial_alignment_release_threshold =
+    swerve_native_mode_ ? std::min(rotate_to_heading_release_threshold_, 0.10) :
+    rotate_to_heading_release_threshold_;
+  bool just_completed_initial_alignment = false;
+
+  if (vla_replay_mode_) {
+    rotating_to_heading_ = false;
+    initial_heading_alignment_complete_ = true;
+  }
+
+  if (!vla_replay_mode_ && !initial_heading_alignment_complete_) {
+    if (rotating_to_heading_) {
+      if (abs_heading_error <= initial_alignment_release_threshold) {
+        rotating_to_heading_ = false;
+        initial_heading_alignment_complete_ = true;
+        just_completed_initial_alignment = true;
+        RCLCPP_INFO(
+          logger_,
+          "Initial heading alignment complete: yaw_error=%.3f rad target_heading=%.3f current_yaw=%.3f release_threshold=%.3f startup_d=%.3f",
+          heading_error, initial_alignment_heading, yaw, initial_alignment_release_threshold,
+          startup_path_progress);
+      }
+    } else if (abs_heading_error > initial_alignment_threshold) {
+      rotating_to_heading_ = true;
+      RCLCPP_INFO(
+        logger_,
+        "Initial heading alignment engaged: error=%.3f rad target_heading=%.3f path_yaw=%.3f current_yaw=%.3f startup_d=%.3f",
+        heading_error, initial_alignment_heading, path_yaw, yaw, startup_path_progress);
+    } else {
+      initial_heading_alignment_complete_ = true;
+    }
+
+    if (rotating_to_heading_) {
+      // Keep solver warm-start in sync with real pose during rotation,
+      // so when alignment completes the warm-start is not stale.
+      StateVec rot_x0 = {
+        pose_in_map.pose.position.x, pose_in_map.pose.position.y, yaw,
+        0.0, 0.0, 0.0};
+      for (int k = 0; k <= horizon_steps_; k++) {
+        solver_->setStateGuess(k, rot_x0);
+      }
+
+      geometry_msgs::msg::TwistStamped cmd_vel;
+      cmd_vel.header.stamp = clock_->now();
+      cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.linear.y = 0.0;
+      const double commanded_omega = std::clamp(
+        rotate_to_heading_gain_ * abs_heading_error,
+        rotate_to_heading_min_angular_vel_,
+        rotate_to_heading_angular_vel_);
+      cmd_vel.twist.angular.z = std::copysign(commanded_omega, heading_error);
+      return cmd_vel;
+    }
+  }
+
+  if (swerve_native_mode_ && initial_heading_alignment_complete_ &&
+    !startup_heading_capture_origin_valid_)
+  {
+    startup_heading_capture_origin_map_ = pose_in_map.pose.position;
+    startup_heading_capture_origin_valid_ = true;
+    startup_heading_capture_progress_ = 0.0;
+  }
+  if (swerve_native_mode_ && startup_heading_capture_origin_valid_) {
+    const double dx =
+      pose_in_map.pose.position.x - startup_heading_capture_origin_map_.x;
+    const double dy =
+      pose_in_map.pose.position.y - startup_heading_capture_origin_map_.y;
+    startup_heading_capture_progress_ = std::max(
+      startup_heading_capture_progress_, std::hypot(dx, dy));
+  }
+
+  // 2.8 Final heading alignment at goal position.
+  //     Once dist < final_rotate_xy_tolerance, NMPC is bypassed entirely:
+  //       - yaw within goal tolerance → zero velocity, let goal_checker confirm
+  //       - yaw outside goal tolerance → rotate in place to align
+  //     This prevents NMPC's residual velocities from causing wheel oscillation.
+  if (!vla_replay_mode_ && current_goal_valid_ && !global_plan_.poses.empty()) {
+    const auto & final_goal = global_plan_.poses.back().pose;
+    const double dx_fg = final_goal.position.x - pose_in_map.pose.position.x;
+    const double dy_fg = final_goal.position.y - pose_in_map.pose.position.y;
+    const double dist_to_final = std::hypot(dx_fg, dy_fg);
+    const double final_rotate_xy_release_tol = std::max(
+      final_rotate_xy_tolerance_, final_rotate_xy_release_tolerance_);
+    const double final_goal_yaw = tf2::getYaw(final_goal.orientation);
+    const double final_yaw_error = normalizeAngle(final_goal_yaw - yaw);
+    const double abs_final_yaw_error = std::abs(final_yaw_error);
+
+    // State 1: rotation completed — hold zero only while we remain inside the
+    // final zone and yaw drift stays within the re-engage threshold.
+    // Otherwise let NMPC pull the robot back into position, or re-enter the
+    // pure rotation state if only yaw drifted.
+    if (final_heading_done_) {
+      if (dist_to_final <= final_rotate_xy_tolerance_ &&
+        abs_final_yaw_error <= final_rotate_yaw_threshold_)
+      {
+        geometry_msgs::msg::TwistStamped cmd_vel;
+        cmd_vel.header.stamp = clock_->now();
+        cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+        return cmd_vel;
+      }
+      final_heading_done_ = false;
+      if (dist_to_final <= final_rotate_xy_tolerance_) {
+        final_heading_alignment_active_ = true;
+        RCLCPP_INFO(logger_,
+          "Final heading re-engaged after yaw drift: dist=%.3f m, yaw_error=%.3f rad, reengage_threshold=%.3f rad",
+          dist_to_final, final_yaw_error, final_rotate_yaw_threshold_);
+      } else {
+        final_heading_alignment_active_ = false;
+        RCLCPP_INFO(logger_,
+          "Final heading hold released: robot drifted outside final zone (dist=%.3f m, limit=%.3f m)",
+          dist_to_final, final_rotate_xy_tolerance_);
+      }
+    }
+
+    // State 2: actively rotating in place
+    if (final_heading_alignment_active_) {
+      if (dist_to_final > final_rotate_xy_release_tol) {
+        final_heading_alignment_active_ = false;
+        RCLCPP_INFO(logger_,
+          "Final heading alignment released: dist=%.3f m exceeded final release zone %.3f m",
+          dist_to_final, final_rotate_xy_release_tol);
+      } else if (abs_final_yaw_error <= final_rotate_yaw_goal_tolerance_) {
+        final_heading_alignment_active_ = false;
+        if (dist_to_final <= final_rotate_xy_tolerance_) {
+          RCLCPP_INFO(logger_,
+            "Final heading alignment complete: yaw_error=%.3f rad dist=%.3f m",
+            final_yaw_error, dist_to_final);
+          final_heading_done_ = true;
+          geometry_msgs::msg::TwistStamped cmd_vel;
+          cmd_vel.header.stamp = clock_->now();
+          cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+          return cmd_vel;
+        }
+        // In release zone but heading aligned: hold zero velocity to avoid oscillation
+        RCLCPP_INFO(logger_,
+          "Final heading aligned in release zone: dist=%.3f m (enter=%.3f, release=%.3f), holding zero velocity",
+          dist_to_final, final_rotate_xy_tolerance_, final_rotate_xy_release_tol);
+        geometry_msgs::msg::TwistStamped cmd_vel;
+        cmd_vel.header.stamp = clock_->now();
+        cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+        return cmd_vel;
+      } else {
+        geometry_msgs::msg::TwistStamped cmd_vel;
+        cmd_vel.header.stamp = clock_->now();
+        cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+        cmd_vel.twist.linear.x = 0.0;
+        cmd_vel.twist.linear.y = 0.0;
+        const double commanded_omega = std::clamp(
+          rotate_to_heading_gain_ * abs_final_yaw_error,
+          rotate_to_heading_min_angular_vel_,
+          rotate_to_heading_angular_vel_);
+        cmd_vel.twist.angular.z = std::copysign(commanded_omega, final_yaw_error);
+        return cmd_vel;
+      }
+    }
+
+    // State 3: entering final zone — bypass NMPC
+    if (dist_to_final < final_rotate_xy_tolerance_) {
+      if (abs_final_yaw_error <= final_rotate_yaw_goal_tolerance_) {
+        RCLCPP_INFO_THROTTLE(logger_, *clock_, 2000,
+          "At goal (dist=%.3f m, yaw_err=%.3f rad), zero vel for goal_checker",
+          dist_to_final, final_yaw_error);
+        final_heading_done_ = true;
+        geometry_msgs::msg::TwistStamped cmd_vel;
+        cmd_vel.header.stamp = clock_->now();
+        cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+        return cmd_vel;
+      }
+      // Yaw not within tolerance — rotate to align
+      final_heading_alignment_active_ = true;
+      RCLCPP_INFO(logger_,
+        "Final heading alignment engaged: dist=%.3f m, yaw_error=%.3f rad, goal_yaw=%.3f, current_yaw=%.3f, release_tol=%.3f",
+        dist_to_final, final_yaw_error, final_goal_yaw, yaw, final_rotate_xy_release_tol);
+      geometry_msgs::msg::TwistStamped cmd_vel;
+      cmd_vel.header.stamp = clock_->now();
+      cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+      cmd_vel.twist.linear.x = 0.0;
+      cmd_vel.twist.linear.y = 0.0;
+      const double commanded_omega = std::clamp(
+        rotate_to_heading_gain_ * abs_final_yaw_error,
+        rotate_to_heading_min_angular_vel_,
+        rotate_to_heading_angular_vel_);
+      cmd_vel.twist.angular.z = std::copysign(commanded_omega, final_yaw_error);
+      return cmd_vel;
+    }
+  }
+
+  // 3. Set initial state: [px, py, theta, vx, vy, omega] in map frame
+  double vx_init = velocity.linear.x;
+  double vy_init = velocity.linear.y;
+  double omega_init = velocity.angular.z;
+  {
+    std::lock_guard<std::mutex> lock(lio_odom_mutex_);
+    if (lio_velocity_valid_) {
+      const double age = (clock_->now() - lio_velocity_stamp_).seconds();
+      if (age < lio_odom_timeout_) {
+        vx_init = lio_velocity_.linear.x;
+        vy_init = lio_velocity_.linear.y;
+        omega_init = lio_velocity_.angular.z;
+      }
+    }
+  }
+
+  if (just_completed_initial_alignment) {
+    vx_init = 0.0;
+    vy_init = 0.0;
+    omega_init = 0.0;
+  }
+
+  StateVec x0 = {
+    pose_in_map.pose.position.x,
+    pose_in_map.pose.position.y,
+    yaw,
+    vx_init,
+    vy_init,
+    omega_init
+  };
+  StateVec solver_x0 = x0;
+  solver_x0[3] = std::clamp(solver_x0[3], vx_min_, vx_max_);
+  solver_x0[4] = std::clamp(solver_x0[4], -vy_max_, vy_max_);
+  solver_x0[5] = std::clamp(solver_x0[5], -omega_max_, omega_max_);
+  if (std::abs(solver_x0[3] - x0[3]) > 1e-3 ||
+    std::abs(solver_x0[4] - x0[4]) > 1e-3 ||
+    std::abs(solver_x0[5] - x0[5]) > 1e-3)
+  {
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "Clamped NMPC initial body speed from [%.2f, %.2f, %.2f] to [%.2f, %.2f, %.2f]",
+      x0[3], x0[4], x0[5], solver_x0[3], solver_x0[4], solver_x0[5]);
+  }
+  solver_->setInitialState(solver_x0);
+
+  // Detect TF jump: compare actual position against the warm-start's
+  // expectation.  After shiftSolution() from the previous cycle, getState(0)
+  // holds what the solver predicted for the current timestep.  A large
+  // discrepancy indicates the map->odom TF was corrected (e.g. by ICP),
+  // making the warm-start stale.  Thresholds must be well above normal
+  // one-step prediction error (~0.03m, ~0.05rad at typical speeds).
+  bool tf_jump_detected = false;
+  {
+    StateVec warm_x0 = solver_->getState(0);
+    const double dpos = std::hypot(solver_x0[0] - warm_x0[0],
+                                   solver_x0[1] - warm_x0[1]);
+    const double dyaw = std::abs(normalizeAngle(solver_x0[2] - warm_x0[2]));
+    constexpr double kTfJumpPosTol = 0.25;   // meters  (0.15→0.25: tolerate ICP recovery snap)
+    constexpr double kTfJumpYawTol = 0.25;   // radians (~14 deg, was ~8.6 deg)
+    if (dpos > kTfJumpPosTol || dyaw > kTfJumpYawTol) {
+      RCLCPP_INFO(logger_,
+        "TF jump detected: pos_delta=%.4f m, yaw_delta=%.4f rad — reseeding warm start",
+        dpos, dyaw);
+      tf_jump_detected = true;
+    }
+  }
+
+  // 4. Compute distance to goal for approach velocity scaling
+  const auto & goal = global_plan_.poses.empty() ? local_path.poses.back() : global_plan_.poses.back();
+  double dx_goal = goal.pose.position.x - pose_in_map.pose.position.x;
+  double dy_goal = goal.pose.position.y - pose_in_map.pose.position.y;
+  double dist_to_goal = std::hypot(dx_goal, dy_goal);
+
+  double vel_scale = 1.0;
+  if (dist_to_goal < approach_velocity_scaling_dist_ && approach_velocity_scaling_dist_ > 0.0) {
+    vel_scale = std::max(0.1, dist_to_goal / approach_velocity_scaling_dist_);
+  }
+
+  const double dx_path0 = local_path.poses.front().pose.position.x - pose_in_map.pose.position.x;
+  const double dy_path0 = local_path.poses.front().pose.position.y - pose_in_map.pose.position.y;
+  const double cross_track_error = std::abs(
+    -std::sin(path_yaw) * dx_path0 + std::cos(path_yaw) * dy_path0);
+  if (cross_track_error > 0.05) {
+    const double cross_track_scale = std::clamp(1.0 - cross_track_error / 0.60, 0.25, 1.0);
+    vel_scale = std::min(vel_scale, cross_track_scale);
+  }
+
+  // Also slow down when heading error is large: the robot can't follow the
+  // path at speed if it's pointing in the wrong direction.  This prevents
+  // the "overshoot at sharp turns → reverse → spiral" failure mode when
+  // allow_lateral_tracking is false.
+  // Threshold must be high enough (~15°) that normal curves don't stall,
+  // but low enough (~45°) that the robot stops before overshooting.
+  if (!vla_replay_mode_ && !swerve_native_mode_ && abs_heading_error > 0.26) {  // ~15°
+    const double heading_scale = std::clamp(1.0 - (abs_heading_error - 0.26) / 0.55, 0.10, 1.0);
+    vel_scale = std::min(vel_scale, heading_scale);
+  }
+
+  double target_vel = desired_linear_vel_ * vel_scale;
+
+  // 5. Sample references along the path (all in map frame)
+  if (vla_replay_mode_) {
+    sampleVlaReplayReferences(local_path, pose_in_map);
+  } else {
+    sampleReferences(local_path, pose_in_map, target_vel);
+  }
+
+  // Re-seed warm start after TF jump or heading alignment, now that
+  // fresh stage_refs_ are available from sampleReferences().
+  if (tf_jump_detected || just_completed_initial_alignment) {
+    seedSolverWarmStart(solver_x0);
+  }
+
+  // 6. Set stage references and costmap parameters
+  for (int k = 0; k < horizon_steps_; k++) {
+    const auto & ref = stage_refs_[k];
+
+    // Stage reference: yref = [x_err_target(zeros), u_target(zeros), costmap_target(0)]
+    // Since cost is (x - xref)^2, we set yref = 0 and pass xref through parameters
+    StageRefVec yref{};  // all zeros (residual targets)
+
+    // Parameters: [xref(6), costmap_cost(1)]
+    ParamVec p{};
+    for (int i = 0; i < NX; i++) {
+      p[i] = ref[i];
+    }
+
+    // Query costmap cost at predicted position (use reference as approximation)
+    double cost = getCostmapCost(ref[0], ref[1]);
+    p[6] = cost;
+
+    solver_->setStageReference(k, yref);
+    solver_->setStageParameters(k, p);
+  }
+
+  // Terminal reference
+  const auto & ref_e = stage_refs_[horizon_steps_];
+  TerminalRefVec yref_e{};  // all zeros
+  ParamVec p_e{};
+  for (int i = 0; i < NX; i++) {
+    p_e[i] = ref_e[i];
+  }
+  p_e[6] = getCostmapCost(ref_e[0], ref_e[1]);
+  solver_->setTerminalReference(yref_e);
+  solver_->setStageParameters(horizon_steps_, p_e);
+
+  // 7. Solve
+  int status = solver_->solve();
+  if (status != 0) {
+    seedSolverWarmStart(solver_x0);
+    const int retry_status = solver_->solve();
+    if (retry_status == 0) {
+      RCLCPP_WARN(
+        logger_,
+        "NMPC recovered after reseeding warm start (initial_status=%d)",
+        status);
+      status = retry_status;
+    }
+  }
+
+  geometry_msgs::msg::TwistStamped cmd_vel;
+  cmd_vel.header.stamp = clock_->now();
+  cmd_vel.header.frame_id = costmap_ros_->getBaseFrameID();
+
+  if (status == 0) {
+    consecutive_failures_ = 0;
+
+    // Extract velocities from predicted state x[1]
+    StateVec x1 = solver_->getState(1);
+    cmd_vel.twist.linear.x = x1[3];   // vx
+    cmd_vel.twist.linear.y = x1[4];   // vy
+    cmd_vel.twist.angular.z = x1[5];  // omega
+    if (vla_replay_mode_) {
+      if (std::abs(cmd_vel.twist.linear.x) < 0.01) {
+        cmd_vel.twist.linear.x = 0.0;
+      }
+      if (std::abs(cmd_vel.twist.linear.y) < 0.015) {
+        cmd_vel.twist.linear.y = 0.0;
+      }
+      if (std::abs(cmd_vel.twist.angular.z) < 0.02) {
+        cmd_vel.twist.angular.z = 0.0;
+      }
+    }
+
+    // Warm-start for next cycle
+    solver_->shiftSolution();
+
+    // Publish predicted trajectory
+    if (visualize_) {
+      publishPredictedPath();
+    }
+
+    // Periodic cross-track / heading diagnostic (every 500ms)
+    {
+      const auto & ref0 = stage_refs_.front();
+      const double ct_dx = solver_x0[0] - ref0[0];
+      const double ct_dy = solver_x0[1] - ref0[1];
+      const double ref_yaw0 = ref0[2];
+      const double cross_track = -std::sin(ref_yaw0) * ct_dx + std::cos(ref_yaw0) * ct_dy;
+      const double heading_err_nmpc = normalizeAngle(solver_x0[2] - ref_yaw0);
+      RCLCPP_INFO_THROTTLE(logger_, *clock_, 500,
+        "NMPC diag: pos=(%.2f,%.2f,%.1f°) ref0=(%.2f,%.2f,%.1f°) "
+        "cross_track=%.3f heading_err=%.1f° cmd=[%.2f,%.2f,%.2f] prune=%zu "
+        "refN_yaw=%.1f° x1_theta=%.1f°",
+        solver_x0[0], solver_x0[1], solver_x0[2] * 180.0 / M_PI,
+        ref0[0], ref0[1], ref_yaw0 * 180.0 / M_PI,
+        cross_track, heading_err_nmpc * 180.0 / M_PI,
+        cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z,
+        last_pruned_plan_index_,
+        stage_refs_.back()[2] * 180.0 / M_PI,
+        solver_->getState(1)[2] * 180.0 / M_PI);
+    }
+
+    RCLCPP_DEBUG(logger_, "NMPC solve: %.2fms, cmd=[%.3f, %.3f, %.3f]",
+      solver_->getSolveTimeMs(), cmd_vel.twist.linear.x,
+      cmd_vel.twist.linear.y, cmd_vel.twist.angular.z);
+  } else {
+    consecutive_failures_++;
+    RCLCPP_WARN(logger_, "NMPC solve failed (status=%d, consecutive=%d)",
+      status, consecutive_failures_);
+
+    const int ref1_idx = std::min(1, horizon_steps_);
+    const auto & ref0 = stage_refs_.front();
+    const auto & ref1 = stage_refs_[ref1_idx];
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "NMPC failure context: x0=[%.2f %.2f %.2f %.2f %.2f %.2f] ref0=[%.2f %.2f %.2f %.2f %.2f %.2f] ref1=[%.2f %.2f %.2f %.2f %.2f %.2f] goal_dist=%.2f heading_err=%.2f cost0=%.2f cost1=%.2f",
+      solver_x0[0], solver_x0[1], solver_x0[2], solver_x0[3], solver_x0[4], solver_x0[5],
+      ref0[0], ref0[1], ref0[2], ref0[3], ref0[4], ref0[5],
+      ref1[0], ref1[1], ref1[2], ref1[3], ref1[4], ref1[5],
+      dist_to_goal, heading_error, getCostmapCost(ref0[0], ref0[1]), getCostmapCost(ref1[0], ref1[1]));
+
+    const double goal_vel_scale =
+      (dist_to_goal < approach_velocity_scaling_dist_ && approach_velocity_scaling_dist_ > 0.0) ?
+      std::max(0.1, dist_to_goal / approach_velocity_scaling_dist_) : 1.0;
+    double fallback_vx = std::min(desired_linear_vel_ * 0.45, vx_max_ * 0.55) * goal_vel_scale;
+    if (abs_heading_error > std::max(rotate_to_heading_threshold_ * 1.4, 0.9)) {
+      fallback_vx = 0.0;
+    } else {
+      const double heading_scale = std::clamp(
+        1.0 - abs_heading_error / std::max(rotate_to_heading_threshold_ * 2.0, 0.6),
+        0.25, 1.0);
+      fallback_vx *= heading_scale;
+    }
+
+    double fallback_vy = 0.0;
+    if (allow_lateral_tracking_ && vy_max_ > 1e-3) {
+      fallback_vy = std::clamp(
+        0.35 * desired_linear_vel_ * std::sin(heading_error),
+        -vy_max_, vy_max_);
+    }
+    const double fallback_omega = std::clamp(1.4 * heading_error, -omega_max_, omega_max_);
+    if (dist_to_goal < 0.15) {
+      fallback_vx *= 0.5;
+      fallback_vy = 0.0;
+    }
+
+    cmd_vel.twist.linear.x = std::clamp(fallback_vx, vx_min_, vx_max_);
+    cmd_vel.twist.linear.y = fallback_vy;
+    cmd_vel.twist.angular.z = fallback_omega;
+
+    RCLCPP_WARN_THROTTLE(
+      logger_, *clock_, 1000,
+      "Using NMPC fallback cmd=[%.2f, %.2f, %.2f] goal_dist=%.2f heading_err=%.2f",
+      cmd_vel.twist.linear.x, cmd_vel.twist.linear.y, cmd_vel.twist.angular.z,
+      dist_to_goal, heading_error);
+    if (consecutive_failures_ >= MAX_CONSECUTIVE_FAILURES) {
+      RCLCPP_ERROR_THROTTLE(
+        logger_, *clock_, 1000,
+        "NMPC remained infeasible for %d cycles; continuing with fallback tracking",
+        consecutive_failures_);
+    }
+  }
+
+  // Cache robot position for warm-starting prune index on replan
+  last_robot_position_map_ = pose_in_map.pose.position;
+  last_robot_position_valid_ = true;
+
+  return cmd_vel;
+}
+
+nav_msgs::msg::Path NmpcController::transformGlobalPlan(
+  const geometry_msgs::msg::PoseStamped & pose,
+  geometry_msgs::msg::PoseStamped & pose_in_map)
+{
+  if (global_plan_.poses.empty()) {
+    throw nav2_core::PlannerException("Global plan is empty");
+  }
+
+  // The global plan is in the map frame.  Instead of transforming the path
+  // to odom (which couples it to the volatile map→odom TF), we keep the path
+  // in the map frame and transform the robot pose *into* the map frame.
+  // This way the reference trajectory is stable and only the robot pose
+  // (which is constrained by x0) changes when ICP corrects map→odom.
+  const std::string plan_frame = global_plan_.header.frame_id;  // "map"
+  const std::string costmap_frame = costmap_ros_->getGlobalFrameID();  // "odom"
+
+  // Transform robot pose from costmap frame (odom) to plan frame (map)
+  geometry_msgs::msg::TransformStamped odom_to_map;
+  try {
+    odom_to_map = tf_->lookupTransform(
+      plan_frame, costmap_frame,
+      tf2::TimePointZero);
+  } catch (const tf2::TransformException & ex) {
+    throw nav2_core::PlannerException(
+      "Could not transform pose to " + plan_frame + ": " + ex.what());
+  }
+  tf2::doTransform(pose, pose_in_map, odom_to_map);
+  pose_in_map.header.frame_id = plan_frame;
+
+  // Cache map→odom for costmap queries
+  try {
+    map_to_odom_tf_ = tf_->lookupTransform(
+      costmap_frame, plan_frame,
+      tf2::TimePointZero);
+    map_to_odom_valid_ = true;
+  } catch (const tf2::TransformException &) {
+    map_to_odom_valid_ = false;
+  }
+
+  if (vla_replay_mode_) {
+    return global_plan_;
+  }
+
+  // Prune passed waypoints with a forward-only local search window.
+  // Use a small forward-progress penalty so the local reference does not jump
+  // across the inside of an S-turn / convex-to-concave transition.
+  const auto & plan = global_plan_;
+  const size_t plan_size = plan.poses.size();
+  size_t closest_idx = std::min(last_pruned_plan_index_, plan_size - 1);
+  size_t search_start = closest_idx;
+  constexpr size_t kBacktrackPoints = 5;
+  if (search_start > kBacktrackPoints) {
+    search_start -= kBacktrackPoints;
+  } else {
+    search_start = 0;
+  }
+
+  size_t search_end = plan_size;
+  const double search_window = std::max(
+    prune_search_distance_, desired_linear_vel_ * horizon_time_ * 4.0);
+  double accum_search_dist = 0.0;
+  for (size_t i = search_start + 1; i < plan_size; i++) {
+    const auto & prev_pose = plan.poses[i - 1].pose.position;
+    const auto & curr_pose = plan.poses[i].pose.position;
+    accum_search_dist += std::hypot(
+      curr_pose.x - prev_pose.x,
+      curr_pose.y - prev_pose.y);
+    if (accum_search_dist >= search_window) {
+      search_end = i + 1;
+      break;
+    }
+  }
+
+  std::vector<double> progress_from_last(search_end, 0.0);
+  double accum_progress = 0.0;
+  if (last_pruned_plan_index_ + 1 < search_end) {
+    for (size_t i = last_pruned_plan_index_ + 1; i < search_end; i++) {
+      const auto & prev_pose = plan.poses[i - 1].pose.position;
+      const auto & curr_pose = plan.poses[i].pose.position;
+      accum_progress += std::hypot(
+        curr_pose.x - prev_pose.x,
+        curr_pose.y - prev_pose.y);
+      progress_from_last[i] = accum_progress;
+    }
+  }
+
+  constexpr double kForwardProgressPenalty = 0.35;
+  double min_score = std::numeric_limits<double>::max();
+  for (size_t i = search_start; i < search_end; i++) {
+    const double dx = plan.poses[i].pose.position.x - pose_in_map.pose.position.x;
+    const double dy = plan.poses[i].pose.position.y - pose_in_map.pose.position.y;
+    const double dist_sq = dx * dx + dy * dy;
+    const double progress_penalty =
+      kForwardProgressPenalty * progress_from_last[i] * progress_from_last[i];
+    const double score = dist_sq + progress_penalty;
+    if (score < min_score) {
+      min_score = score;
+      closest_idx = i;
+    }
+  }
+  last_pruned_plan_index_ = closest_idx;
+
+  // Start the local reference from the closest projection on the path segment,
+  // not just the closest discrete waypoint, so the robot center tracks the path centerline.
+  nav_msgs::msg::Path pruned;
+  pruned.header = plan.header;  // stays in map frame
+  if (plan_size == 1) {
+    pruned.poses.push_back(plan.poses.front());
+  } else {
+    geometry_msgs::msg::PoseStamped projected_pose = plan.poses[closest_idx];
+    size_t projected_insert_idx = closest_idx;
+    double min_proj_dist = std::numeric_limits<double>::max();
+    const size_t segment_start = (closest_idx > 0) ? closest_idx - 1 : closest_idx;
+    const size_t segment_end = std::min(closest_idx + 1, plan_size - 2);
+
+    for (size_t i = segment_start; i <= segment_end; i++) {
+      const auto & p0 = plan.poses[i].pose.position;
+      const auto & p1 = plan.poses[i + 1].pose.position;
+      const double seg_dx = p1.x - p0.x;
+      const double seg_dy = p1.y - p0.y;
+      const double seg_len_sq = seg_dx * seg_dx + seg_dy * seg_dy;
+      if (seg_len_sq < 1e-8) {
+        continue;
+      }
+
+      const double proj_alpha = std::clamp(
+        ((pose_in_map.pose.position.x - p0.x) * seg_dx +
+         (pose_in_map.pose.position.y - p0.y) * seg_dy) / seg_len_sq,
+        0.0, 1.0);
+      const double proj_x = p0.x + proj_alpha * seg_dx;
+      const double proj_y = p0.y + proj_alpha * seg_dy;
+      const double dx = proj_x - pose_in_map.pose.position.x;
+      const double dy = proj_y - pose_in_map.pose.position.y;
+      const double proj_dist_sq = dx * dx + dy * dy;
+
+      if (proj_dist_sq < min_proj_dist) {
+        min_proj_dist = proj_dist_sq;
+        projected_pose = plan.poses[i];
+        projected_pose.pose.position.x = proj_x;
+        projected_pose.pose.position.y = proj_y;
+        if (!vla_replay_mode_) {
+          tf2::Quaternion q;
+          q.setRPY(0.0, 0.0, std::atan2(seg_dy, seg_dx));
+          projected_pose.pose.orientation = tf2::toMsg(q);
+        } else {
+          const double yaw0 = tf2::getYaw(plan.poses[i].pose.orientation);
+          const double yaw1 = tf2::getYaw(plan.poses[i + 1].pose.orientation);
+          const double interp_yaw = interpolateAngle(yaw0, yaw1, proj_alpha);
+          tf2::Quaternion q;
+          q.setRPY(0.0, 0.0, interp_yaw);
+          projected_pose.pose.orientation = tf2::toMsg(q);
+        }
+        projected_insert_idx = i + 1;
+      }
+    }
+
+    pruned.poses.push_back(projected_pose);
+    pruned.poses.insert(
+      pruned.poses.end(),
+      plan.poses.begin() + projected_insert_idx,
+      plan.poses.end());
+  }
+
+  // Ensure we always include enough path to reach the goal, even if that
+  // requires looking beyond the standard horizon. The standard horizon limit
+  // prevents tracking too-far-future references, but we must never truncate
+  // the path short of the actual goal.
+  const double dist_to_goal_from_robot = std::hypot(
+    plan.poses.back().pose.position.x - pose_in_map.pose.position.x,
+    plan.poses.back().pose.position.y - pose_in_map.pose.position.y);
+  const double max_lookahead = std::max(
+    desired_linear_vel_ * horizon_time_ * 2.0,
+    dist_to_goal_from_robot + 0.5);  // Goal distance + safety margin
+  double accum_dist = 0.0;
+  size_t max_idx = pruned.poses.size();
+  for (size_t i = 1; i < pruned.poses.size(); i++) {
+    double dx = pruned.poses[i].pose.position.x - pruned.poses[i - 1].pose.position.x;
+    double dy = pruned.poses[i].pose.position.y - pruned.poses[i - 1].pose.position.y;
+    accum_dist += std::hypot(dx, dy);
+    if (accum_dist > max_lookahead) {
+      max_idx = i + 1;
+      break;
+    }
+  }
+  pruned.poses.resize(max_idx);
+
+  return pruned;
+}
+
+void NmpcController::sampleReferences(
+  const nav_msgs::msg::Path & local_path,
+  const geometry_msgs::msg::PoseStamped & pose,
+  double desired_vel)
+{
+  double dt = horizon_time_ / horizon_steps_;
+
+  // Compute cumulative arc lengths of the path
+  std::vector<double> arc_lengths(local_path.poses.size(), 0.0);
+  for (size_t i = 1; i < local_path.poses.size(); i++) {
+    double dx = local_path.poses[i].pose.position.x - local_path.poses[i - 1].pose.position.x;
+    double dy = local_path.poses[i].pose.position.y - local_path.poses[i - 1].pose.position.y;
+    arc_lengths[i] = arc_lengths[i - 1] + std::hypot(dx, dy);
+  }
+  double total_length = arc_lengths.back();
+  const double current_yaw = tf2::getYaw(pose.pose.orientation);
+  double final_goal_yaw = tf2::getYaw(local_path.poses.back().pose.orientation);
+  double dist_to_final_goal = total_length;
+  if (!global_plan_.poses.empty()) {
+    const auto & final_goal = global_plan_.poses.back().pose;
+    final_goal_yaw = tf2::getYaw(final_goal.orientation);
+    dist_to_final_goal = std::hypot(
+      final_goal.position.x - pose.pose.position.x,
+      final_goal.position.y - pose.pose.position.y);
+  }
+
+  const double goal_align_trigger_dist = std::max(
+    std::max(0.0, goal_heading_align_dist_) * 2.0,
+    std::max(0.0, desired_vel) * horizon_time_);
+  const bool align_to_final_goal =
+    dist_to_final_goal <= goal_align_trigger_dist || total_length <= std::max(0.05, goal_heading_align_dist_);
+  const double clamped_align_ratio = std::clamp(goal_heading_align_ratio_, 0.0, 1.0);
+  double align_start_s = total_length;
+  if (align_to_final_goal) {
+    align_start_s = std::min(
+      total_length * clamped_align_ratio,
+      std::max(0.0, total_length - std::max(0.0, goal_heading_align_dist_)));
+  }
+
+  std::vector<double> s_refs(horizon_steps_ + 1, 0.0);
+  std::vector<double> px_refs(horizon_steps_ + 1, pose.pose.position.x);
+  std::vector<double> py_refs(horizon_steps_ + 1, pose.pose.position.y);
+  std::vector<double> path_yaw_refs(horizon_steps_ + 1, current_yaw);
+  std::vector<double> raw_theta_refs(horizon_steps_ + 1, current_yaw);
+  std::vector<double> theta_refs(horizon_steps_ + 1, current_yaw);
+  std::vector<double> speed_refs(horizon_steps_ + 1, 0.0);
+  const double native_heading_lookahead_dist = std::clamp(
+    desired_vel * 0.6, 0.16, 0.28);
+  const double startup_path_progress = startup_heading_capture_progress_;
+
+  const auto computeThetaRef = [&](double px, double py, double path_yaw, double target_s) {
+    if (swerve_native_mode_) {
+      const double gx = global_plan_.poses.empty() ? local_path.poses.back().pose.position.x :
+        global_plan_.poses.back().pose.position.x;
+      const double gy = global_plan_.poses.empty() ? local_path.poses.back().pose.position.y :
+        global_plan_.poses.back().pose.position.y;
+      const double native_theta_ref = computeSwerveNativeHeadingReference(
+        px, py, gx, gy, final_goal_yaw);
+      if (start_heading_capture_dist_ > 1e-6) {
+        const double startup_s = startup_path_progress + target_s;
+        const double capture_blend = std::clamp(
+          startup_s / start_heading_capture_dist_, 0.0, 1.0);
+        // Always use interpolateAngle even when blend >= 1.0 so that the
+        // returned angle is numerically continuous with blend < 1.0 values.
+        // Returning native_theta_ref directly could introduce a 2-pi jump
+        // (e.g. interpolateAngle gives 198° while atan2 gives -162°).
+        return interpolateAngle(path_yaw, native_theta_ref, capture_blend);
+      }
+      return native_theta_ref;
+    }
+
+    double theta_ref = path_yaw;
+    if (align_to_final_goal && (target_s >= total_length - 0.01 || total_length <= 1e-3)) {
+      theta_ref = final_goal_yaw;
+    } else if (allow_lateral_tracking_ && align_to_final_goal && total_length > align_start_s + 1e-6) {
+      double blend = std::clamp(
+        (target_s - align_start_s) / (total_length - align_start_s),
+        0.0, 1.0);
+      theta_ref = interpolateAngle(path_yaw, final_goal_yaw, blend);
+    }
+
+    return theta_ref;
+  };
+
+  // Sample N+1 reference points. The path tangent defines desired motion in the
+  // world frame, while the body heading is blended toward the goal heading.
+  for (int k = 0; k <= horizon_steps_; k++) {
+    double target_s = desired_vel * dt * k;
+    target_s = std::min(target_s, total_length);
+    s_refs[k] = target_s;
+
+    // Find segment containing target_s via binary search
+    auto it = std::lower_bound(arc_lengths.begin(), arc_lengths.end(), target_s);
+    size_t idx = std::distance(arc_lengths.begin(), it);
+    if (idx >= local_path.poses.size()) {
+      idx = local_path.poses.size() - 1;
+    }
+
+    // Interpolate position and path tangent
+    double px, py, path_yaw;
+    if (idx == 0 || arc_lengths[idx] == arc_lengths[idx - 1]) {
+      px = local_path.poses[idx].pose.position.x;
+      py = local_path.poses[idx].pose.position.y;
+      // Prefer path orientation over current_yaw for consistency
+      path_yaw = tf2::getYaw(local_path.poses[idx].pose.orientation);
+      // Fallback if orientation is invalid
+      if (std::isnan(path_yaw) || std::isinf(path_yaw)) {
+        path_yaw = (k > 0) ? path_yaw_refs[k - 1] : current_yaw;
+      }
+    } else {
+      double seg_len = arc_lengths[idx] - arc_lengths[idx - 1];
+      double alpha = (target_s - arc_lengths[idx - 1]) / seg_len;
+      alpha = std::clamp(alpha, 0.0, 1.0);
+
+      double x0 = local_path.poses[idx - 1].pose.position.x;
+      double y0 = local_path.poses[idx - 1].pose.position.y;
+      double x1 = local_path.poses[idx].pose.position.x;
+      double y1 = local_path.poses[idx].pose.position.y;
+      px = x0 + alpha * (x1 - x0);
+      py = y0 + alpha * (y1 - y0);
+      path_yaw = std::atan2(y1 - y0, x1 - x0);
+    }
+
+    const double theta_ref = computeThetaRef(px, py, path_yaw, target_s);
+
+    double remaining = std::max(0.0, dist_to_final_goal - target_s);
+    double speed_ref = desired_vel;
+    if (remaining < approach_velocity_scaling_dist_) {
+      double scale = std::max(0.0, remaining / approach_velocity_scaling_dist_);
+      speed_ref *= scale;
+    }
+    if (swerve_native_mode_ && start_heading_capture_dist_ > 1e-6) {
+      const double startup_s = startup_path_progress + target_s;
+      if (startup_s < start_heading_capture_dist_) {
+        const double startup_blend = std::clamp(
+          startup_s / start_heading_capture_dist_, 0.0, 1.0);
+        const double startup_speed_scale = start_speed_min_scale_ +
+          (1.0 - start_speed_min_scale_) * startup_blend;
+        speed_ref *= startup_speed_scale;
+      }
+    }
+
+    px_refs[k] = px;
+    py_refs[k] = py;
+    path_yaw_refs[k] = path_yaw;
+    theta_refs[k] = theta_ref;
+    speed_refs[k] = speed_ref;
+  }
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    if (swerve_native_mode_) {
+      const double fallback_yaw = (k > 0) ? path_yaw_refs[k - 1] : current_yaw;
+      path_yaw_refs[k] = samplePathHeadingAtArc(
+        local_path,
+        arc_lengths,
+        s_refs[k],
+        native_heading_lookahead_dist,
+        fallback_yaw);
+    } else {
+      const int prev_k = std::max(0, k - 1);
+      const int next_k = std::min(horizon_steps_, k + 1);
+      const double dx = px_refs[next_k] - px_refs[prev_k];
+      const double dy = py_refs[next_k] - py_refs[prev_k];
+      if (std::hypot(dx, dy) > 1e-4) {
+        path_yaw_refs[k] = std::atan2(dy, dx);
+      } else if (k > 0) {
+        path_yaw_refs[k] = path_yaw_refs[k - 1];
+      }
+    }
+
+    const double target_s = s_refs[k];
+    const double theta_ref = computeThetaRef(px_refs[k], py_refs[k], path_yaw_refs[k], target_s);
+    raw_theta_refs[k] = theta_ref;
+  }
+
+  std::vector<double> path_yaw_rates(horizon_steps_ + 1, 0.0);
+  if (horizon_steps_ > 0 && dt > 1e-6) {
+    for (int k = 1; k <= horizon_steps_; k++) {
+      path_yaw_rates[k] = normalizeAngle(path_yaw_refs[k] - path_yaw_refs[k - 1]) / dt;
+    }
+    path_yaw_rates[0] = path_yaw_rates[1];
+  }
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    double local_yaw_rate = std::abs(path_yaw_rates[k]);
+    if (k + 1 <= horizon_steps_) {
+      local_yaw_rate = std::max(local_yaw_rate, std::abs(path_yaw_rates[k + 1]));
+    }
+    double curve_scale = 1.0 / (1.0 + curve_speed_reduction_gain_ * local_yaw_rate);
+    curve_scale = std::clamp(curve_scale, curve_speed_min_scale_, 1.0);
+
+    if (k > 0 && k < horizon_steps_) {
+      const double prev_rate = path_yaw_rates[k];
+      const double next_rate = path_yaw_rates[k + 1];
+      const bool curve_switch =
+        prev_rate * next_rate < 0.0 &&
+        std::abs(prev_rate) > curve_switch_yaw_rate_threshold_ &&
+        std::abs(next_rate) > curve_switch_yaw_rate_threshold_;
+      if (curve_switch) {
+        curve_scale = std::min(curve_scale, curve_switch_speed_scale_);
+      }
+    }
+    speed_refs[k] *= curve_scale;
+  }
+
+  const double smoothing_gain = swerve_native_mode_ ? 1.0 :
+    std::clamp(reference_heading_smoothing_gain_, 0.0, 1.0);
+  if (smoothing_gain >= 0.999) {
+    theta_refs = raw_theta_refs;
+  } else {
+    theta_refs[0] = interpolateAngle(current_yaw, raw_theta_refs[0], smoothing_gain);
+    for (int k = 1; k <= horizon_steps_; k++) {
+      theta_refs[k] = interpolateAngle(theta_refs[k - 1], raw_theta_refs[k], smoothing_gain);
+    }
+  }
+
+  if (total_length <= 1e-3) {
+    std::fill(theta_refs.begin(), theta_refs.end(), align_to_final_goal ? final_goal_yaw : current_yaw);
+  }
+
+  // Unwrap theta_refs so that adjacent entries differ by at most pi.
+  // interpolateAngle returns values anchored to path_yaw, and when path_yaw
+  // crosses ±pi along the horizon the result can jump by ~2pi even though
+  // the underlying angle is continuous.  ACADOS uses raw (theta - theta_ref)
+  // in its cost, so a 2-pi numerical jump causes the solver to command a
+  // full-revolution spin instead of a small correction.
+  for (int k = 1; k <= horizon_steps_; k++) {
+    const double delta = theta_refs[k] - theta_refs[k - 1];
+    if (delta > M_PI) {
+      theta_refs[k] -= 2.0 * M_PI;
+    } else if (delta < -M_PI) {
+      theta_refs[k] += 2.0 * M_PI;
+    }
+  }
+
+  std::vector<double> omega_refs(horizon_steps_ + 1, 0.0);
+  if (horizon_steps_ > 0 && dt > 1e-6) {
+    const double omega_step_limit = std::max(1e-3, alpha_max_ * dt * reference_omega_rate_limit_scale_);
+    for (int k = 0; k <= horizon_steps_; k++) {
+      double raw_omega = 0.0;
+      if (k < horizon_steps_) {
+        raw_omega = normalizeAngle(theta_refs[k + 1] - theta_refs[k]) / dt;
+      } else {
+        raw_omega = normalizeAngle(theta_refs[k] - theta_refs[k - 1]) / dt;
+      }
+      raw_omega = std::clamp(raw_omega, -omega_max_, omega_max_);
+
+      if (k == 0) {
+        omega_refs[k] = raw_omega;
+      } else {
+        const double blended =
+          reference_omega_smoothing_gain_ * omega_refs[k - 1] +
+          (1.0 - reference_omega_smoothing_gain_) * raw_omega;
+        omega_refs[k] = std::clamp(
+          blended,
+          omega_refs[k - 1] - omega_step_limit,
+          omega_refs[k - 1] + omega_step_limit);
+        omega_refs[k] = std::clamp(omega_refs[k], -omega_max_, omega_max_);
+      }
+    }
+  }
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    const double theta_ref = theta_refs[k];
+    const double path_yaw = path_yaw_refs[k];
+    const double speed_ref = speed_refs[k];
+
+    double vx_ref = speed_ref;
+    double vy_ref = 0.0;
+    if (allow_lateral_tracking_) {
+      const double world_vx = speed_ref * std::cos(path_yaw);
+      const double world_vy = speed_ref * std::sin(path_yaw);
+      vx_ref = std::cos(theta_ref) * world_vx + std::sin(theta_ref) * world_vy;
+      vy_ref = -std::sin(theta_ref) * world_vx + std::cos(theta_ref) * world_vy;
+    }
+
+    stage_refs_[k] = {px_refs[k], py_refs[k], theta_ref, vx_ref, vy_ref, omega_refs[k]};
+  }
+}
+
+void NmpcController::sampleVlaReplayReferences(
+  const nav_msgs::msg::Path & local_path,
+  const geometry_msgs::msg::PoseStamped & pose)
+{
+  const double solver_dt = horizon_time_ / horizon_steps_;
+  const size_t n = local_path.poses.size();
+  const double current_yaw = tf2::getYaw(pose.pose.orientation);
+
+  if (n == 0) {
+    std::fill(stage_refs_.begin(), stage_refs_.end(), StateVec{
+      pose.pose.position.x, pose.pose.position.y, current_yaw, 0.0, 0.0, 0.0});
+    return;
+  }
+
+  std::vector<double> xs(n, 0.0);
+  std::vector<double> ys(n, 0.0);
+  std::vector<double> yaws(n, current_yaw);
+  for (size_t i = 0; i < n; i++) {
+    xs[i] = local_path.poses[i].pose.position.x;
+    ys[i] = local_path.poses[i].pose.position.y;
+    const double raw_yaw = tf2::getYaw(local_path.poses[i].pose.orientation);
+    if (i == 0) {
+      yaws[i] = current_yaw + normalizeAngle(raw_yaw - current_yaw);
+    } else {
+      yaws[i] = yaws[i - 1] + normalizeAngle(raw_yaw - yaws[i - 1]);
+    }
+  }
+
+  const double point_dt = std::max(0.02, vla_replay_point_dt_);
+  const double last_t = point_dt * static_cast<double>(n - 1);
+  const auto sample_pose = [&](double t, double & px, double & py, double & theta) {
+    if (n == 1 || t <= 0.0) {
+      px = xs.front();
+      py = ys.front();
+      theta = yaws.front();
+      return;
+    }
+    if (t >= last_t) {
+      px = xs.back();
+      py = ys.back();
+      theta = yaws.back();
+      return;
+    }
+
+    const double scaled = t / point_dt;
+    const size_t i0 = std::min(static_cast<size_t>(std::floor(scaled)), n - 2);
+    const size_t i1 = i0 + 1;
+    const double alpha = std::clamp(scaled - static_cast<double>(i0), 0.0, 1.0);
+    px = xs[i0] + alpha * (xs[i1] - xs[i0]);
+    py = ys[i0] + alpha * (ys[i1] - ys[i0]);
+    theta = yaws[i0] + alpha * (yaws[i1] - yaws[i0]);
+  };
+
+  std::vector<double> px_refs(horizon_steps_ + 1, pose.pose.position.x);
+  std::vector<double> py_refs(horizon_steps_ + 1, pose.pose.position.y);
+  std::vector<double> theta_refs(horizon_steps_ + 1, current_yaw);
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    sample_pose(solver_dt * static_cast<double>(k), px_refs[k], py_refs[k], theta_refs[k]);
+  }
+
+  // Keep the first reference tied to the actual constrained state. The future
+  // samples still come from the VLA path, so pure rotation keeps its timing.
+  px_refs[0] = pose.pose.position.x;
+  py_refs[0] = pose.pose.position.y;
+  theta_refs[0] = current_yaw;
+
+  for (int k = 1; k <= horizon_steps_; k++) {
+    const double delta = theta_refs[k] - theta_refs[k - 1];
+    if (delta > M_PI) {
+      theta_refs[k] -= 2.0 * M_PI;
+    } else if (delta < -M_PI) {
+      theta_refs[k] += 2.0 * M_PI;
+    }
+  }
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    const int k_next = std::min(k + 1, horizon_steps_);
+    const int k_prev = std::max(k - 1, 0);
+    const double vel_dt = (k == horizon_steps_) ? solver_dt : solver_dt;
+
+    double world_vx = 0.0;
+    double world_vy = 0.0;
+    double omega_ref = 0.0;
+    if (k < horizon_steps_ && vel_dt > 1e-6) {
+      world_vx = (px_refs[k_next] - px_refs[k]) / vel_dt;
+      world_vy = (py_refs[k_next] - py_refs[k]) / vel_dt;
+      omega_ref = (theta_refs[k_next] - theta_refs[k]) / vel_dt;
+    } else if (k > 0 && vel_dt > 1e-6) {
+      world_vx = (px_refs[k] - px_refs[k_prev]) / vel_dt;
+      world_vy = (py_refs[k] - py_refs[k_prev]) / vel_dt;
+      omega_ref = (theta_refs[k] - theta_refs[k_prev]) / vel_dt;
+    }
+
+    const double theta_ref = theta_refs[k];
+    const double vx_ref = std::clamp(
+      std::cos(theta_ref) * world_vx + std::sin(theta_ref) * world_vy,
+      vx_min_, vx_max_);
+    const double vy_ref = std::clamp(
+      -std::sin(theta_ref) * world_vx + std::cos(theta_ref) * world_vy,
+      -vy_max_, vy_max_);
+    omega_ref = std::clamp(omega_ref, -omega_max_, omega_max_);
+    stage_refs_[k] = {
+      px_refs[k],
+      py_refs[k],
+      theta_ref,
+      vx_ref,
+      vy_ref,
+      omega_ref};
+  }
+}
+
+void NmpcController::seedSolverWarmStart(const StateVec & x0)
+{
+  if (!solver_) {
+    return;
+  }
+
+  const double dt = horizon_steps_ > 0 ? horizon_time_ / horizon_steps_ : 0.0;
+  solver_->setStateGuess(0, x0);
+
+  for (int k = 0; k < horizon_steps_; k++) {
+    const auto & x_guess = stage_refs_[k + 1];
+    solver_->setStateGuess(k + 1, x_guess);
+
+    ControlVec u_guess{};
+    if (dt > 1e-6) {
+      const auto & from = (k == 0) ? x0 : stage_refs_[k];
+      const auto & to = stage_refs_[k + 1];
+      u_guess[0] = std::clamp((to[3] - from[3]) / dt, -ax_max_, ax_max_);
+      u_guess[1] = std::clamp((to[4] - from[4]) / dt, -ay_max_, ay_max_);
+      u_guess[2] = std::clamp((to[5] - from[5]) / dt, -alpha_max_, alpha_max_);
+    }
+    solver_->setControlGuess(k, u_guess);
+  }
+}
+
+double NmpcController::getCostmapCost(double map_x, double map_y) const
+{
+  // Convert map-frame position to costmap frame (odom) for costmap query
+  double wx = map_x;
+  double wy = map_y;
+  if (map_to_odom_valid_) {
+    const auto & t = map_to_odom_tf_.transform;
+    // Apply 2D transform: rotation around z + translation
+    double cz = t.rotation.w * t.rotation.w - t.rotation.z * t.rotation.z;
+    double sz = 2.0 * t.rotation.w * t.rotation.z;
+    wx = cz * map_x - sz * map_y + t.translation.x;
+    wy = sz * map_x + cz * map_y + t.translation.y;
+  }
+
+  unsigned int mx, my;
+  if (!costmap_->worldToMap(wx, wy, mx, my)) {
+    return 0.5;
+  }
+
+  unsigned char cost = costmap_->getCost(mx, my);
+
+  if (cost == nav2_costmap_2d::LETHAL_OBSTACLE ||
+      cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE)
+  {
+    return 1.0;
+  } else if (cost == nav2_costmap_2d::NO_INFORMATION) {
+    return 0.5;
+  } else {
+    // Normalize 0-252 to 0.0-0.98
+    return static_cast<double>(cost) / 253.0;
+  }
+}
+
+void NmpcController::publishPredictedPath()
+{
+  if (!predicted_path_pub_ || predicted_path_pub_->get_subscription_count() == 0) {
+    return;
+  }
+
+  nav_msgs::msg::Path path;
+  path.header.stamp = clock_->now();
+  path.header.frame_id = global_plan_.header.frame_id;  // "map" — consistent with solver frame
+
+  for (int k = 0; k <= horizon_steps_; k++) {
+    StateVec x = solver_->getState(k);
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header = path.header;
+    ps.pose.position.x = x[0];
+    ps.pose.position.y = x[1];
+    ps.pose.position.z = 0.0;
+
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, x[2]);
+    ps.pose.orientation.x = q.x();
+    ps.pose.orientation.y = q.y();
+    ps.pose.orientation.z = q.z();
+    ps.pose.orientation.w = q.w();
+
+    path.poses.push_back(ps);
+  }
+
+  predicted_path_pub_->publish(path);
+}
+
+nav_msgs::msg::Path NmpcController::localAstarAvoidance(
+  const nav_msgs::msg::Path & local_path,
+  const geometry_msgs::msg::PoseStamped & /*pose_in_map*/)
+{
+  if (local_path.poses.size() < 3) {
+    return local_path;
+  }
+
+  // 1. Compute arc lengths
+  const size_t n = local_path.poses.size();
+  std::vector<double> arc(n, 0.0);
+  for (size_t i = 1; i < n; i++) {
+    double dx = local_path.poses[i].pose.position.x - local_path.poses[i - 1].pose.position.x;
+    double dy = local_path.poses[i].pose.position.y - local_path.poses[i - 1].pose.position.y;
+    arc[i] = arc[i - 1] + std::hypot(dx, dy);
+  }
+
+  // 2. Scan for obstacles within lookahead distance
+  int obstacle_start_idx = -1;
+  int obstacle_end_idx = -1;
+  int consecutive_high = 0;
+
+  for (size_t i = 0; i < n; i++) {
+    if (arc[i] > local_astar_obstacle_lookahead_) {
+      break;
+    }
+    double cost = getCostmapCost(
+      local_path.poses[i].pose.position.x,
+      local_path.poses[i].pose.position.y);
+    if (cost >= local_astar_cost_threshold_) {
+      consecutive_high++;
+      if (consecutive_high >= 2) {
+        if (obstacle_start_idx < 0) {
+          obstacle_start_idx = static_cast<int>(i) - 1;
+        }
+        obstacle_end_idx = static_cast<int>(i);
+      }
+    } else {
+      if (obstacle_start_idx >= 0 && obstacle_end_idx >= 0) {
+        break;
+      }
+      consecutive_high = 0;
+    }
+  }
+
+  // 3. No obstacle — fast path
+  if (obstacle_start_idx < 0 || obstacle_end_idx < 0) {
+    return local_path;
+  }
+
+  // 4. A* start point: one point before obstacle
+  int astar_start_idx = std::max(0, obstacle_start_idx - 1);
+
+  // 5. Find reconnect point: past obstacle_end, accumulated distance > reconnect_dist and low cost
+  int reconnect_idx = -1;
+  double accum = 0.0;
+  for (size_t i = static_cast<size_t>(obstacle_end_idx) + 1; i < n; i++) {
+    double dx = local_path.poses[i].pose.position.x - local_path.poses[i - 1].pose.position.x;
+    double dy = local_path.poses[i].pose.position.y - local_path.poses[i - 1].pose.position.y;
+    accum += std::hypot(dx, dy);
+    if (accum >= local_astar_reconnect_dist_) {
+      double cost = getCostmapCost(
+        local_path.poses[i].pose.position.x,
+        local_path.poses[i].pose.position.y);
+      if (cost < local_astar_cost_threshold_) {
+        reconnect_idx = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+
+  if (reconnect_idx < 0) {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+      "A* local avoidance: no safe reconnect point found, using original path");
+    return local_path;
+  }
+
+  // 6. Run A*
+  double start_x = local_path.poses[astar_start_idx].pose.position.x;
+  double start_y = local_path.poses[astar_start_idx].pose.position.y;
+  double goal_x = local_path.poses[reconnect_idx].pose.position.x;
+  double goal_y = local_path.poses[reconnect_idx].pose.position.y;
+
+  auto detour = runAstarOnCostmap(start_x, start_y, goal_x, goal_y);
+  if (detour.empty()) {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 2000,
+      "A* local avoidance: A* search failed, using original path");
+    return local_path;
+  }
+
+  // 7. Smooth
+  smoothAstarPath(detour);
+
+  // 8. Splice: pre-obstacle + detour + post-reconnect
+  nav_msgs::msg::Path result;
+  result.header = local_path.header;
+
+  // Pre-obstacle segment
+  for (int i = 0; i < astar_start_idx; i++) {
+    result.poses.push_back(local_path.poses[i]);
+  }
+
+  // A* detour segment
+  for (const auto & pt : detour) {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header = local_path.header;
+    ps.pose.position.x = pt.first;
+    ps.pose.position.y = pt.second;
+    ps.pose.position.z = 0.0;
+    ps.pose.orientation.w = 1.0;
+    result.poses.push_back(ps);
+  }
+
+  // Post-reconnect segment
+  for (size_t i = static_cast<size_t>(reconnect_idx) + 1; i < n; i++) {
+    result.poses.push_back(local_path.poses[i]);
+  }
+
+  // 9. Publish detour for RViz
+  if (astar_detour_pub_ && astar_detour_pub_->get_subscription_count() > 0) {
+    nav_msgs::msg::Path detour_msg;
+    detour_msg.header = local_path.header;
+    detour_msg.header.stamp = clock_->now();
+    for (const auto & pt : detour) {
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header = detour_msg.header;
+      ps.pose.position.x = pt.first;
+      ps.pose.position.y = pt.second;
+      ps.pose.position.z = 0.0;
+      ps.pose.orientation.w = 1.0;
+      detour_msg.poses.push_back(ps);
+    }
+    astar_detour_pub_->publish(detour_msg);
+  }
+
+  RCLCPP_DEBUG(logger_,
+    "A* local avoidance: obstacle [%d-%d], detour %zu pts, reconnect at %d",
+    obstacle_start_idx, obstacle_end_idx, detour.size(), reconnect_idx);
+
+  return result;
+}
+
+std::vector<std::pair<double, double>> NmpcController::runAstarOnCostmap(
+  double start_x, double start_y,
+  double goal_x, double goal_y)
+{
+  std::vector<std::pair<double, double>> result;
+
+  if (!map_to_odom_valid_) {
+    return result;
+  }
+
+  // Transform map→odom (costmap frame)
+  const auto & t = map_to_odom_tf_.transform;
+  double cz = t.rotation.w * t.rotation.w - t.rotation.z * t.rotation.z;
+  double sz = 2.0 * t.rotation.w * t.rotation.z;
+
+  auto mapToOdom = [&](double mx, double my, double & ox, double & oy) {
+    ox = cz * mx - sz * my + t.translation.x;
+    oy = sz * mx + cz * my + t.translation.y;
+  };
+
+  // Inverse: odom→map
+  double det = cz * cz + sz * sz;
+  if (det < 1e-6) {
+    RCLCPP_WARN_THROTTLE(logger_, *clock_, 1000,
+      "A* inverse transform: degenerate rotation matrix (det=%.6f)", det);
+    return result;
+  }
+  auto odomToMap = [&](double ox, double oy, double & mx, double & my) {
+    double dx = ox - t.translation.x;
+    double dy = oy - t.translation.y;
+    mx = (cz * dx + sz * dy) / det;
+    my = (-sz * dx + cz * dy) / det;
+  };
+
+  double start_ox, start_oy, goal_ox, goal_oy;
+  mapToOdom(start_x, start_y, start_ox, start_oy);
+  mapToOdom(goal_x, goal_y, goal_ox, goal_oy);
+
+  // World to costmap grid
+  unsigned int start_mx, start_my, goal_mx, goal_my;
+  if (!costmap_->worldToMap(start_ox, start_oy, start_mx, start_my) ||
+      !costmap_->worldToMap(goal_ox, goal_oy, goal_mx, goal_my))
+  {
+    return result;
+  }
+
+  const unsigned int size_x = costmap_->getSizeInCellsX();
+  const unsigned int size_y = costmap_->getSizeInCellsY();
+  const size_t total_cells = static_cast<size_t>(size_x) * size_y;
+
+  auto toIndex = [size_x](unsigned int x, unsigned int y) -> size_t {
+    return static_cast<size_t>(y) * size_x + x;
+  };
+
+  // A* data structures
+  std::vector<double> g_cost(total_cells, std::numeric_limits<double>::max());
+  std::vector<bool> closed(total_cells, false);
+  std::vector<size_t> parent(total_cells, std::numeric_limits<size_t>::max());
+
+  struct Node {
+    double f;
+    size_t idx;
+    bool operator>(const Node & other) const { return f > other.f; }
+  };
+  std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open;
+
+  size_t start_idx = toIndex(start_mx, start_my);
+  size_t goal_idx = toIndex(goal_mx, goal_my);
+
+  g_cost[start_idx] = 0.0;
+  double heuristic = std::hypot(
+    static_cast<double>(goal_mx) - start_mx,
+    static_cast<double>(goal_my) - start_my);
+  open.push({heuristic, start_idx});
+
+  // 8-connected neighbors: dx, dy, distance
+  static const int dx8[] = {-1, 0, 1, -1, 1, -1, 0, 1};
+  static const int dy8[] = {-1, -1, -1, 0, 0, 1, 1, 1};
+  static const double dist8[] = {M_SQRT2, 1.0, M_SQRT2, 1.0, 1.0, M_SQRT2, 1.0, M_SQRT2};
+
+  constexpr int MAX_ITERATIONS = 5000;
+  int iterations = 0;
+  bool found = false;
+
+  while (!open.empty() && iterations < MAX_ITERATIONS) {
+    iterations++;
+    Node current = open.top();
+    open.pop();
+
+    if (current.idx == goal_idx) {
+      found = true;
+      break;
+    }
+
+    if (closed[current.idx]) {
+      continue;
+    }
+    closed[current.idx] = true;
+
+    unsigned int cx = static_cast<unsigned int>(current.idx % size_x);
+    unsigned int cy = static_cast<unsigned int>(current.idx / size_x);
+
+    for (int d = 0; d < 8; d++) {
+      int nx = static_cast<int>(cx) + dx8[d];
+      int ny = static_cast<int>(cy) + dy8[d];
+
+      if (nx < 0 || ny < 0 ||
+          static_cast<unsigned int>(nx) >= size_x ||
+          static_cast<unsigned int>(ny) >= size_y)
+      {
+        continue;
+      }
+
+      size_t neighbor_idx = toIndex(
+        static_cast<unsigned int>(nx), static_cast<unsigned int>(ny));
+      if (closed[neighbor_idx]) {
+        continue;
+      }
+
+      unsigned char raw_cost = costmap_->getCost(
+        static_cast<unsigned int>(nx), static_cast<unsigned int>(ny));
+
+      // Impassable cells
+      if (raw_cost == nav2_costmap_2d::LETHAL_OBSTACLE ||
+          raw_cost == nav2_costmap_2d::INSCRIBED_INFLATED_OBSTACLE ||
+          raw_cost == nav2_costmap_2d::NO_INFORMATION)
+      {
+        continue;
+      }
+
+      // Movement cost with inflation penalty
+      double normalized_cost = static_cast<double>(raw_cost) / 253.0;
+      double move_cost = dist8[d] *
+        (1.0 + 5.0 * std::max(0.0, normalized_cost - local_astar_inflation_cost_));
+
+      double tentative_g = g_cost[current.idx] + move_cost;
+      if (tentative_g < g_cost[neighbor_idx]) {
+        g_cost[neighbor_idx] = tentative_g;
+        parent[neighbor_idx] = current.idx;
+        double h = std::hypot(
+          static_cast<double>(goal_mx) - nx,
+          static_cast<double>(goal_my) - ny);
+        open.push({tentative_g + h, neighbor_idx});
+      }
+    }
+  }
+
+  if (!found) {
+    return result;
+  }
+
+  // Backtrace with cycle protection
+  std::vector<size_t> path_indices;
+  size_t trace = goal_idx;
+  size_t max_backtrace = total_cells;
+  while (trace != start_idx && trace != std::numeric_limits<size_t>::max() && max_backtrace-- > 0) {
+    path_indices.push_back(trace);
+    trace = parent[trace];
+  }
+  if (max_backtrace == 0) {
+    RCLCPP_ERROR(logger_,
+      "A* backtrace exceeded max iterations, possible cycle in parent array");
+    return result;
+  }
+  path_indices.push_back(start_idx);
+  std::reverse(path_indices.begin(), path_indices.end());
+
+  // Convert grid → odom → map
+  double resolution = costmap_->getResolution();
+  double origin_x = costmap_->getOriginX();
+  double origin_y = costmap_->getOriginY();
+
+  for (size_t idx : path_indices) {
+    unsigned int gx = static_cast<unsigned int>(idx % size_x);
+    unsigned int gy = static_cast<unsigned int>(idx / size_x);
+    double odom_x = origin_x + (gx + 0.5) * resolution;
+    double odom_y = origin_y + (gy + 0.5) * resolution;
+    double map_px, map_py;
+    odomToMap(odom_x, odom_y, map_px, map_py);
+    result.emplace_back(map_px, map_py);
+  }
+
+  return result;
+}
+
+void NmpcController::smoothAstarPath(std::vector<std::pair<double, double>> & path)
+{
+  if (path.size() < 3 || local_astar_smooth_iterations_ <= 0) {
+    return;
+  }
+
+  const double w_smooth = local_astar_smooth_weight_;
+  const double w_data = 1.0 - w_smooth;
+
+  auto original = path;
+  for (int iter = 0; iter < local_astar_smooth_iterations_; iter++) {
+    for (size_t i = 1; i + 1 < path.size(); i++) {
+      path[i].first += w_data * (original[i].first - path[i].first) +
+        w_smooth * (path[i - 1].first + path[i + 1].first - 2.0 * path[i].first);
+      path[i].second += w_data * (original[i].second - path[i].second) +
+        w_smooth * (path[i - 1].second + path[i + 1].second - 2.0 * path[i].second);
+    }
+  }
+
+  // Downsample: keep every other point to achieve ~0.10m spacing
+  if (path.size() > 4) {
+    std::vector<std::pair<double, double>> downsampled;
+    downsampled.push_back(path.front());
+    for (size_t i = 2; i + 1 < path.size(); i += 2) {
+      downsampled.push_back(path[i]);
+    }
+    downsampled.push_back(path.back());
+    path = std::move(downsampled);
+  }
+}
+
+}  // namespace nmpc_controller
+
+PLUGINLIB_EXPORT_CLASS(nmpc_controller::NmpcController, nav2_core::Controller)

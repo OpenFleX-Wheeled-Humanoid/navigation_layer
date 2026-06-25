@@ -1,0 +1,24 @@
+# u-blox GNSS 接收器配置
+ublox_gps_node:
+  ros__parameters:
+    device: /dev/ublox_gps
+    frame_id: gps_link
+    uart1:
+      baudrate: 9600
+    publish:
+      all: false
+      nav:
+        all: true
+    rate: 5.0           # Hz
+    nav_rate: 5          # 导航解算速率
+    dynamic_model: pedestrian
+    fix_mode: auto
+
+    enable_ppp: false
+    gnss:
+      gps: true
+      glonass: true
+      beidou: true
+      galileo: true
+      qzss: false
+      sbas: false
