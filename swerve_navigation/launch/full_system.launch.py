@@ -14,10 +14,15 @@ import os
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
-# Import lidar config helper
-livox_dir_for_import = get_package_share_directory('livox_ros_driver2')
+# Import the helper installed with swerve_navigation itself.
 import sys
-sys.path.insert(0, os.path.join(livox_dir_for_import, 'launch_ROS2'))
+navigation_launch_dir = os.path.join(
+    get_package_share_directory('swerve_navigation'),
+    'launch',
+)
+if navigation_launch_dir not in sys.path:
+    sys.path.insert(0, navigation_launch_dir)
+
 from lidar_config_helper import merge_lidar_config
 
 from launch import LaunchDescription

@@ -161,9 +161,15 @@ def generate_launch_description():
     # ========== 4. livox_ros_driver2 ==========
     # Import lidar config helper to merge ~/.openflex/lidar_config.yaml
     livox_dir = get_package_share_directory('livox_ros_driver2')
+
     import sys
-    livox_launch_dir = os.path.join(livox_dir, 'launch_ROS2')
-    sys.path.insert(0, livox_launch_dir)
+    navigation_launch_dir = os.path.join(
+        get_package_share_directory('swerve_navigation'),
+        'launch',
+    )
+    if navigation_launch_dir not in sys.path:
+        sys.path.insert(0, navigation_launch_dir)
+
     from lidar_config_helper import merge_lidar_config
 
     base_lidar_config = os.path.join(livox_dir, 'config', 'MID360_config.json')

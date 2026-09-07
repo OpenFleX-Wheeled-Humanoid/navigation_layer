@@ -37,7 +37,6 @@ class CmdVelSafetyGate(Node):
         self.cmd_pub = self.create_publisher(Twist, self.output_cmd_topic, qos)
         self.create_subscription(Twist, self.input_cmd_topic, self._on_cmd, qos)
         self.create_subscription(Empty, self.hold_topic, self._on_hold, qos)
-
         self.last_cmd: Optional[Twist] = None
         self.last_cmd_time = None
         self.hold_until = None
