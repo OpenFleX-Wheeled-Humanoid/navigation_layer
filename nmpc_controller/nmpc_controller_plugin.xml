@@ -1,0 +1,10 @@
+<library path="nmpc_controller">
+  <class name="nmpc_controller::NmpcController"
+         type="nmpc_controller::NmpcController"
+         base_class_type="nav2_core::Controller">
+    <description>
+      NMPC controller using acados SQP_RTI for swerve drive navigation.
+      6-state model (x, y, theta, vx, vy, omega) with acceleration controls.
+    </description>
+  </class>
+</library>
