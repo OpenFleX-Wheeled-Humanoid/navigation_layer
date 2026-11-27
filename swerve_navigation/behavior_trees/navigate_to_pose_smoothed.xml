@@ -1,0 +1,54 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithStablePath">
+        <!--
+          Plan-once 策略:
+          - 目标未变 且 路径在全局costmap上有效 → 不重规划
+          - 目标变化 或 路径无效(全局costmap被彻底阻断) → 触发重规划(安全网)
+          - 局部避障由 NMPC 控制器内嵌 A* 处理，不依赖全局重规划
+        -->
+        <RecoveryNode number_of_retries="1" name="ComputeAndSmoothPath">
+          <Fallback>
+            <ReactiveSequence>
+              <Inverter><GlobalUpdatedGoal/></Inverter>
+              <IsPathValid path="{path}"/>
+            </ReactiveSequence>
+            <Sequence name="PlanAndSmooth">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"/>
+            </Sequence>
+          </Fallback>
+          <ClearEntireCostmap
+            name="ClearGlobalCostmap-Context"
+            service_name="global_costmap/clear_entirely_global_costmap"/>
+        </RecoveryNode>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath
+            path="{path}"
+            controller_id="FollowPath"
+            goal_checker_id="general_goal_checker"/>
+          <ClearEntireCostmap
+            name="ClearLocalCostmap-Context"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap
+              name="ClearLocalCostmap-Subtree"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap-Subtree"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <BackUp backup_dist="0.30" backup_speed="0.15"/>
+          <Spin spin_dist="1.57"/>
+          <Wait wait_duration="2.0"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

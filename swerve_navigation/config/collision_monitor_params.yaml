@@ -1,0 +1,78 @@
+# Collision Monitor — Livox-only 安全层
+# D435 不再参与导航避障，避免相机 TF/时间戳/深度噪声导致误停或崩溃
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    cmd_vel_in_topic: "cmd_vel"
+    cmd_vel_out_topic: "cmd_vel_safe_in"
+    transform_tolerance: 0.2
+    source_timeout: 0.8
+    base_shift_correction: false
+    stop_pub_timeout: 0.5
+    polygons: ["StopZone", "SlowZone", "RearStopZone", "RearSlowZone", "LeftStopZone", "RightStopZone"]
+    StopZone:
+      type: "polygon"
+      # 前方 0.42~0.80m, 宽 ±0.35m (贴近 footprint 外扩)
+      points: [0.80, 0.35, 0.80, -0.35, 0.42, -0.35, 0.42, 0.35]
+      action_type: "stop"
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/stop_zone"
+      enabled: true
+    SlowZone:
+      type: "polygon"
+      # 前方 0.60~1.20m, 宽 ±0.45m
+      points: [1.20, 0.45, 1.20, -0.45, 0.60, -0.45, 0.60, 0.45]
+      action_type: "slowdown"
+      slowdown_ratio: 0.30
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/slow_zone"
+      enabled: true
+    RearStopZone:
+      type: "polygon"
+      # 后方 -0.42~-0.80m, 宽 ±0.35m (贴近 footprint 外扩)
+      points: [-0.42, 0.35, -0.42, -0.35, -0.80, -0.35, -0.80, 0.35]
+      action_type: "stop"
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/rear_stop_zone"
+      enabled: true
+    RearSlowZone:
+      type: "polygon"
+      # 后方 -0.60~-1.20m, 宽 ±0.45m
+      points: [-0.60, 0.45, -0.60, -0.45, -1.20, -0.45, -1.20, 0.45]
+      action_type: "slowdown"
+      slowdown_ratio: 0.30
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/rear_slow_zone"
+      enabled: true
+    LeftStopZone:
+      type: "polygon"
+      # 左侧 y: 0.35~0.55m, x: -0.42~0.42m
+      points: [0.42, 0.55, 0.42, 0.35, -0.42, 0.35, -0.42, 0.55]
+      action_type: "stop"
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/left_stop_zone"
+      enabled: true
+    RightStopZone:
+      type: "polygon"
+      # 右侧 y: -0.35~-0.55m, x: -0.42~0.42m
+      points: [0.42, -0.35, 0.42, -0.55, -0.42, -0.55, -0.42, -0.35]
+      action_type: "stop"
+      max_points: 5
+      visualize: true
+      polygon_pub_topic: "collision_monitor/right_stop_zone"
+      enabled: true
+    observation_sources: ["pointcloud_lidar"]
+    # Livox 3D 点云 — 360° 全周安全
+    pointcloud_lidar:
+      type: "pointcloud"
+      topic: "/livox/body_cloud_nav2"
+      min_height: 0.12
+      max_height: 1.50
+      enabled: true

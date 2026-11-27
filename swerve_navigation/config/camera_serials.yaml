@@ -1,0 +1,7 @@
+# Chassis RealSense D435 serial number used by this package's launch files.
+# The OpenFlex deployment center (相机配置) overwrites it from
+# ~/.openflex/cameras_config.yaml (cameras.base) and then rebuilds the
+# workspace, because the installed share/ copy is what the launch reads.
+cameras:
+  base:
+    serial_no: '335522071763'

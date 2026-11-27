@@ -1,0 +1,50 @@
+# NMPC Controller 参数参考
+# 这些参数在 nav2_params.yaml 的 FollowPath 块中配置
+nmpc_controller:
+  ros__parameters:
+    # 预测范围
+    horizon_steps: 20        # N: 预测步数
+    horizon_time: 2.0        # Tf: 预测时间 (s)
+
+    # 状态跟踪权重 Q
+    Q_px: 15.0
+    Q_py: 15.0
+    Q_theta: 10.0
+    Q_vx: 1.0
+    Q_vy: 1.0
+    Q_omega: 0.5
+
+    # 控制量权重 R
+    R_ax: 0.1
+    R_ay: 0.1
+    R_alpha: 0.05
+
+    # 终端权重 Q_e
+    Q_e_px: 30.0
+    Q_e_py: 30.0
+    Q_e_theta: 20.0
+    Q_e_vx: 1.0
+    Q_e_vy: 1.0
+    Q_e_omega: 0.5
+
+    # 避障权重
+    costmap_weight: 50.0
+
+    # 速度约束
+    vx_max: 0.5
+    vx_min: -0.3
+    vy_max: 0.5
+    omega_max: 1.0
+
+    # 加速度约束
+    ax_max: 2.0
+    ay_max: 2.0
+    alpha_max: 3.0
+
+    # 路径跟踪
+    desired_linear_vel: 0.4
+    approach_velocity_scaling_dist: 0.5
+    transform_tolerance: 0.1
+
+    # 可视化
+    visualize: true
